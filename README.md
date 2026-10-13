@@ -145,6 +145,11 @@ voice chat itself is not a delivery target. When you ask by voice for something 
   Sheet must be owned by you, not shared, and last modified by you. Ownership is checked again right before
   a task starts. The platform is registered as `trusted_inbound` for that reason: events come from the
   Google account you authorized, not from other people
+- **Calendar edit rights:** Google does not say who edited an event. An event is taken as the plugin first saw
+  it (normally within a minute of its creation; changes in its first two minutes are taken as the Gemini app
+  finishing it), and any later change to its title, time or description by anyone but the plugin means it is
+  not run. Someone you gave "make changes to events" on your primary calendar could still change a brand-new
+  event before that first look: do not give that right to others, or leave `calendar` out of `sources`
 - **Your text is never deleted.** The plugin replaces only the exact block it wrote itself, where it wrote it
   (in a Doc at the recorded position, in an event only as the very end of the description, in a Sheet in the
   recorded row), never by searching for `[Hermes]`; if anything changed there, the reply is appended instead.

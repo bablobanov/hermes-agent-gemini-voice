@@ -8,7 +8,9 @@
 - The plugin's own OAuth token (`calendar.events.owned`, `drive.metadata.readonly`, `documents`,
   `spreadsheets`), refreshed in memory only; `hermes gemini-voice auth | check | status`
 - Owner-only boundary: invitations, shared files, events added or edited by other people, recurring events and
-  the plugin's own outputs are never tasks; ownership is re-checked right before a task starts
+  the plugin's own outputs are never tasks; ownership is re-checked right before a task starts, and an event's
+  title, time and description must still be what the plugin first saw (or what its own writes made them); the
+  event acknowledgement is recorded before it is written, so a crash right after it never makes it look foreign
 - One shared chat, one task at a time (the next starts when the gateway finished the previous turn, and not
   while it resumes turns interrupted by a restart); replies are routed by their anchor, and a reply without one
   goes only to the task interrupted by the restart; a final reply is journaled the moment it arrives; durable
@@ -27,8 +29,9 @@
   the two targets (else `doc`)
 - Unattended: a broken token is reported as `retrying / auth_failed` in the gateway status, without a browser
   flow and without stopping the gateway; one refused or unreachable API does not stop the others or the replies;
-  the newest Drive files are read on every poll and the rest of the window is walked over the next polls, and a
-  calendar pass longer than one poll goes on from the last change read (by time, never by page token), so a
-  burst of changes hides nothing; a task Google does not answer for is retried with growing pauses for about 45
+  Drive files created in the last 15 minutes are read on every poll and the rest of the window is walked over
+  the next polls, and a calendar pass longer than one poll goes on from the last change read (by time, never by
+  page token); a second holding more changes than a poll reads is read deeper in the same poll, so a burst of
+  changes hides nothing; a task Google does not answer for is retried with growing pauses for about 45
   minutes, then closed with a note that is written as soon as Google answers again
 - Standard library only; unit tests without network, optional contract test against a Hermes checkout
