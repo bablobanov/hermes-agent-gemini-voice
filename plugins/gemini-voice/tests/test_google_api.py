@@ -53,6 +53,18 @@ class TokenTests(unittest.TestCase):
             client(fake).request("GET", "https://www.googleapis.com/drive/v3/files")
         self.assertEqual(ctx.exception.code, "network")
 
+    def test_connection_dropped_while_reading_is_transient(self):
+        import http.client
+        fake = FakeGoogle()
+        c = client(fake)
+        c.request("GET", "https://www.googleapis.com/drive/v3/files")
+
+        def dropping(*_args):
+            raise http.client.IncompleteRead(b"{", 120)
+        c._transport = dropping
+        with self.assertRaises(api.TransientError):
+            c.request("GET", "https://www.googleapis.com/drive/v3/files")
+
 
 class ErrorMappingTests(unittest.TestCase):
     def check(self, status, reason, expected, code):
@@ -69,6 +81,7 @@ class ErrorMappingTests(unittest.TestCase):
 
     def test_mapping(self):
         self.check(503, "backendError", api.TransientError, "http_503")
+        self.check(408, "", api.TransientError, "http_408")
         self.check(429, "rateLimitExceeded", api.TransientError, "http_429")
         self.check(403, "userRateLimitExceeded", api.TransientError, "http_403")
         self.check(403, "insufficientPermissions", api.AuthError, "insufficient_scope")

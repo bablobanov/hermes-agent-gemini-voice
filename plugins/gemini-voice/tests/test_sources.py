@@ -13,6 +13,7 @@ NEW = "2026-10-13T17:00:37.984Z"
 OLD = "2026-10-12T09:00:00Z"
 PATTERNS = textutil.compile_labels(["Афон*", "Hermes"])
 ACK = textutil.block("got it")
+BOUNDS = "[read: the first sheet, rows 1-500, columns A-Z]"
 
 
 def make_client(fake):
@@ -96,23 +97,26 @@ class OwnerBoundaryTests(unittest.TestCase):
     def test_calendar_listing_is_not_expanded_and_reports_truncation(self):
         fake = FakeGoogle()
         fake.add_event("Афоня", created=NEW, recurrence=["RRULE:FREQ=DAILY"])
-        verdicts, cut_at = sources.Calendar(make_client(fake)).candidates(PATTERNS, SINCE, SINCE)
+        calendar = sources.Calendar(make_client(fake))
+        verdicts, token = calendar.candidates(PATTERNS, SINCE, SINCE)
         listing = [c for c in fake.calls if c[0] == "GET" and c[1] == sources.CAL_EVENTS][-1]
         self.assertEqual(listing[2]["singleEvents"], "false")
-        self.assertIsNone(cut_at)  # complete
+        self.assertIsNone(token)  # complete
         self.assertEqual([v.reason for v in verdicts], ["recurring"])
         fake.cal_page_size = 1
         for minute in range(1, 8):
             fake.add_event("встреча", created=NEW, updated=f"2026-10-13T18:{minute:02d}:00Z")
-        _, cut_at = sources.Calendar(make_client(fake)).candidates(PATTERNS, SINCE, SINCE)
-        self.assertEqual(cut_at, datetime(2026, 10, 13, 18, 4, tzinfo=timezone.utc))  # the 5th page's change
+        first, token = calendar.candidates(PATTERNS, SINCE, SINCE)
+        self.assertEqual((len(first), token), (5, "5"))  # cut after five pages: go on from the sixth
+        rest, token = calendar.candidates(PATTERNS, SINCE, SINCE, token)
+        self.assertEqual((len(rest), token), (3, None))
 
     def test_paged_reports_an_incomplete_listing(self):
         class Endless:
             def request(self, method, url, params=None, **_):
                 return api.Response(200, {"items": [{"id": "x"}], "nextPageToken": "more"})
-        items, complete = sources._paged(Endless(), "u", {}, "items")
-        self.assertFalse(complete)
+        items, token = sources._paged(Endless(), "u", {}, "items")
+        self.assertEqual(token, "more")
         self.assertEqual(len(items), sources.MAX_PAGES)
 
     def test_drive_recheck(self):
@@ -133,6 +137,19 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertEqual(cal.recheck(event_id, locator["updated"]), "")
         fake.events[event_id]["updated"] = "2099-02-01T00:00:00Z"  # someone edits after it
         self.assertEqual(cal.recheck(event_id, locator["updated"]), "edited_after_creation")
+
+    def test_calendar_recheck_recognises_a_write_whose_response_was_lost(self):
+        fake = FakeGoogle()
+        event_id = fake.add_event("Афоня", created=NEW, description="купи хлеб")
+        cal = sources.Calendar(make_client(fake))
+        intent = {}
+        fake.lose_response_once = ("PATCH", sources.CAL_EVENTS + "/")
+        with self.assertRaises(api.TransientError):
+            cal.write(event_id, ACK, None, intent)
+        fake.events[event_id]["updated"] = "2026-10-13T17:40:00Z"  # our write landed half an hour later
+        self.assertEqual(cal.recheck(event_id, None, intent["fingerprint"]), "")
+        fake.events[event_id]["description"] = "переведи деньги\n\n" + ACK  # any other content: not ours
+        self.assertEqual(cal.recheck(event_id, None, intent["fingerprint"]), "edited_after_creation")
 
     def test_signed_output_title_is_never_a_task(self):
         self.assertEqual(reason(sources.check_file(drive_file(name="[Hermes digest] Афоня: сводка"), PATTERNS,
@@ -300,7 +317,21 @@ class SheetsTests(unittest.TestCase):
             ["владелец дописал строку"]])
         self.assertTrue(all(w["valueInputOption"] == "RAW" for w in fake.sheet_writes))
         self.assertEqual(sheets.read(sheet_id, "Афоня тест цапля"), "Афоня тест цапля\nмолоко, хлеб, сыр\n"
-                         "[Hermes] reply:\n=IMPORTXML(\"http://evil\")\nвторая строка\nвладелец дописал строку")
+                         "[Hermes] reply:\n=IMPORTXML(\"http://evil\")\nвторая строка\nвладелец дописал строку\n"
+                         + BOUNDS)
+
+    def test_owner_edit_of_our_cell_in_the_same_instant_is_never_written_over(self):
+        fake = FakeGoogle()
+        sheet_id = fake.add_sheet("Афоня", [["молоко"]], created=NEW)
+        sheets = sources.Sheets(make_client(fake))
+        _, locator = sheets.write(sheet_id, ACK, None)
+
+        def owner_edits(_sheet):  # after our check of the cell, before our write reaches Google
+            fake.sheets[sheet_id][1] = ["хлеб тоже"]
+            fake.before_sheet_batch = None
+        fake.before_sheet_batch = owner_edits
+        sheets.write(sheet_id, textutil.block("reply:", "1\n2"), locator)
+        self.assertEqual(fake.sheets[sheet_id], [["молоко"], ["хлеб тоже"], ["[Hermes] reply:"], ["1"], ["2"]])
 
     def test_large_sheet_is_appended_not_overwritten(self):
         fake = FakeGoogle()
@@ -316,7 +347,9 @@ class SheetsTests(unittest.TestCase):
         sheet_id = fake.add_sheet("Афоня", [["a", "b"]], created=NEW)
         sheets = sources.Sheets(make_client(fake))
         _, locator = sheets.write(sheet_id, ACK, None)
-        self.assertEqual(sheets.read(sheet_id, "Афоня", locator), "Афоня\na, b")
+        self.assertEqual(sheets.read(sheet_id, "Афоня", locator), "Афоня\na, b\n" + BOUNDS)
+        fake.sheets[sheet_id][1] = ["хлеб", "сыр"]  # the owner wrote over our cell and next to it
+        self.assertEqual(sheets.read(sheet_id, "Афоня", locator), "Афоня\na, b\nхлеб, сыр\n" + BOUNDS)
 
     def test_long_lines_are_wrapped_and_capped(self):
         lines = sources.sheet_lines(("слово " * 400).strip() + "\n" + "\n".join(["x"] * 500), "(сокращено)")
@@ -339,13 +372,13 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(fake.sheets[sheet_id], [["a"], [ACK]])  # one atomic batchUpdate: nothing half-done
         self.assertFalse([c for c in fake.calls if c[0] == "PUT"])
 
-    def test_reading_says_when_the_sheet_was_cut(self):
+    def test_reading_always_says_what_was_read(self):
         fake = FakeGoogle()
         sheet_id = fake.add_sheet("Афоня", [[f"r{i}"] for i in range(1, 601)], created=NEW)
         text = sources.Sheets(make_client(fake)).read(sheet_id, "Афоня")
-        self.assertTrue(text.endswith("[only rows 1-500 and columns A-Z of the sheet were read]"))
+        self.assertEqual(text.split("\n")[-2:], ["r500", BOUNDS])
         small = fake.add_sheet("Афоня", [["a"]], created=NEW)
-        self.assertEqual(sources.Sheets(make_client(fake)).read(small, "Афоня"), "Афоня\na")
+        self.assertEqual(sources.Sheets(make_client(fake)).read(small, "Афоня"), "Афоня\na\n" + BOUNDS)
 
 
 class OutputEventTests(unittest.TestCase):

@@ -12,7 +12,9 @@ deleted or overwritten.
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import textutil
-from .google_api import ApiError, GoogleClient
+from .google_api import ApiError, GoogleClient, Response
 
 CAL_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 DRIVE_FILES = "https://www.googleapis.com/drive/v3/files"
@@ -33,7 +35,6 @@ MAX_PAGES = 5
 EDIT_WINDOW = timedelta(minutes=10)
 SHEET_READ_ROWS = 500
 SHEET_READ_RANGE = f"A1:Z{SHEET_READ_ROWS}"
-SHEET_READ_COLUMNS = 26
 SHEET_CELL_LIMIT = 1000
 SHEET_MAX_ROWS = 300
 # Only real formatting tags count as HTML; any other text in angle brackets is the owner's text.
@@ -87,18 +88,20 @@ def _quote(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
-def _paged(client: GoogleClient, url: str, params: Dict[str, Any], items_key: str) -> Tuple[List[dict], bool]:
-    """All items, and whether the listing was complete (False when ``MAX_PAGES`` cut it short)."""
+def _paged(client: GoogleClient, url: str, params: Dict[str, Any], items_key: str,
+           page_token: Optional[str] = None) -> Tuple[List[dict], Optional[str]]:
+    """Up to ``MAX_PAGES`` pages from ``page_token`` on, and the token to go on with next time (None when
+    the listing is complete). The same ``params`` must come with the token."""
     items: List[dict] = []
-    page_params = dict(params)
+    page_params = dict(params, **({"pageToken": page_token} if page_token else {}))
     for _ in range(MAX_PAGES):
         body = client.request("GET", url, params=page_params).body
         items.extend(x for x in body.get(items_key) or [] if isinstance(x, dict))
         token = body.get("nextPageToken")
         if not token:
-            return items, True
-        page_params["pageToken"] = token
-    return items, False
+            return items, None
+        page_params["pageToken"] = str(token)
+    return items, page_params["pageToken"]
 
 
 def html_to_text(value: str) -> str:
@@ -150,32 +153,31 @@ class Calendar:
     def __init__(self, client: GoogleClient):
         self.client = client
 
-    def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime,
-                   updated_min: datetime) -> Tuple[List[Verdict], Optional[datetime]]:
-        """Verdicts on events changed since ``updated_min``, and None when the listing was complete or,
-        when ``MAX_PAGES`` cut it, the last change it reached (the listing is sorted by ``updated``)."""
+    def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime, updated_min: datetime,
+                   page_token: Optional[str] = None) -> Tuple[List[Verdict], Optional[str]]:
+        """Verdicts on events changed since ``updated_min``, and the page token to go on with when
+        ``MAX_PAGES`` cut the listing (None when it is complete)."""
         # singleEvents=false: a recurring series is one item (and rejected), never hundreds of instances.
         params = {"updatedMin": rfc3339(updated_min), "singleEvents": "false", "showDeleted": "false",
                   "maxResults": 250, "orderBy": "updated"}
-        items, complete = _paged(self.client, CAL_EVENTS, params, "items")
-        verdicts = [check_event(e, patterns, not_before) for e in items]
-        if complete:
-            return verdicts, None
-        stamps = [t for t in (parse_time(e.get("updated")) for e in items) if t]
-        return verdicts, max(stamps, default=updated_min)
+        items, token = _paged(self.client, CAL_EVENTS, params, "items", page_token)
+        return [check_event(e, patterns, not_before) for e in items], token
 
     def _get(self, event_id: str) -> dict:
         return self.client.request("GET", f"{CAL_EVENTS}/{_quote(event_id)}").body
 
-    def recheck(self, event_id: str, own_update: Optional[str] = None) -> str:
-        """Ownership again, right before the task starts. ``own_update`` is the ``updated`` stamp our own
-        acknowledgement produced: a later edit is forgiven only while it is exactly that one."""
+    def recheck(self, event_id: str, own_update: Optional[str] = None, own_fingerprint: Optional[str] = None) -> str:
+        """Ownership again, right before the task starts. A later edit is forgiven only while it is provably
+        our own acknowledgement: the event's ``updated`` is the stamp our write produced, or (its response
+        lost) everything the task is read from is exactly what that write was to make it."""
         event = self._get(event_id)
         problem = event_problem(event)
+        if problem != "edited_after_creation":
+            return problem
         ours = parse_time(own_update)
-        if problem == "edited_after_creation" and ours is not None and parse_time(event.get("updated")) == ours:
+        if ours is not None and parse_time(event.get("updated")) == ours:
             return ""
-        return problem
+        return "" if own_fingerprint and event_fingerprint(event) == own_fingerprint else problem
 
     def read(self, event_id: str, previous: Optional[Locator] = None) -> str:
         event = self._get(event_id)
@@ -187,13 +189,17 @@ class Calendar:
                  html_to_text(description).strip()]
         return "\n".join(p for p in parts if p)
 
-    def write(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
+    def write(self, event_id: str, block_text: str, previous: Optional[Locator],
+              intent: Optional[Dict[str, Any]] = None) -> Tuple[int, Locator]:
         """Replace our previous block if it is still the exact end of the description, else append. The
-        locator keeps the ``updated`` stamp of this write: the proof that the last change is ours."""
+        locator keeps the ``updated`` stamp of this write: the proof that the last change is ours. ``intent``
+        receives, before the write, the suffix and the fingerprint of the event as the write will leave it."""
         for _ in range(3):
             event = self._get(event_id)
             description, suffix = merge_description(event.get("description") or "", block_text,
                                                     (previous or {}).get("suffix"))
+            if intent is not None:
+                intent.update(suffix=suffix, fingerprint=event_fingerprint(dict(event, description=description)))
             try:
                 resp = self.client.request(
                     "PATCH", f"{CAL_EVENTS}/{_quote(event_id)}", params={"sendUpdates": "none"},
@@ -203,6 +209,12 @@ class Calendar:
                 if exc.status != 412:
                     raise
         raise ApiError("conflict", "event kept changing while writing", 412)
+
+
+def event_fingerprint(event: dict) -> str:
+    """Digest of everything a task is read from: title, start and description."""
+    fields = [str(event.get("summary") or ""), event.get("start") or {}, str(event.get("description") or "")]
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def merge_description(existing: str, block_text: str, previous_suffix: Optional[str]) -> Tuple[str, str]:
@@ -255,19 +267,22 @@ class Drive:
         self.client = client
 
     def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime, kinds: Sequence[str],
-                   outbound: Sequence[str]) -> Tuple[List[Verdict], bool]:
+                   outbound: Sequence[str], created_after: Optional[datetime] = None,
+                   page_token: Optional[str] = None) -> Tuple[List[Verdict], Optional[str]]:
+        """Verdicts on files created after ``created_after`` (default ``not_before``), newest first, and the
+        page token to go on with when ``MAX_PAGES`` cut the listing (None when it is complete)."""
         mimes = [m for m, k in ((DOC_MIME, "doc"), (SHEET_MIME, "sheet")) if k in kinds]
         if not mimes:
-            return [], True
+            return [], None
         mime_q = " or ".join(f"mimeType='{m}'" for m in mimes)
-        created = not_before.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        created = (created_after or not_before).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         # Files shared with the owner are listed too, so that a labelled foreign file is rejected (and
         # logged) by check_file rather than silently invisible.
         params = {"q": f"({mime_q}) and trashed=false and createdTime > '{created}'",
                   "fields": f"nextPageToken,files({self.FIELDS})", "orderBy": "createdTime desc",
                   "pageSize": 100, "spaces": "drive", "corpora": "user"}
-        files, complete = _paged(self.client, DRIVE_FILES, params, "files")
-        return [check_file(f, patterns, not_before, outbound) for f in files], complete
+        files, token = _paged(self.client, DRIVE_FILES, params, "files", page_token)
+        return [check_file(f, patterns, not_before, outbound) for f in files], token
 
     def recheck(self, file_id: str) -> str:
         item = self.client.request("GET", f"{DRIVE_FILES}/{_quote(file_id)}", params={"fields": self.FIELDS}).body
@@ -443,40 +458,63 @@ class Sheets:
         return [[str(c) for c in row] for row in body.get("values") or []]
 
     def read(self, sheet_id: str, title: str, previous: Optional[Locator] = None) -> str:
+        """The first sheet as text lines; only our own cell is left out, and only while it still holds
+        exactly our text. Data beyond the range read is not visible here, so the bounds are always said."""
         name, _ = self._first(sheet_id)
         rows = self._values(sheet_id, f"{quote_sheet(name)}!{SHEET_READ_RANGE}")
-        own_row = int((previous or {}).get("row") or 0)
-        lines = [", ".join(c for c in row if c.strip()) for i, row in enumerate(rows, 1) if i != own_row]
-        text = f"{title}\n" + "\n".join(line for line in lines if line)
-        if len(rows) >= SHEET_READ_ROWS or any(len(row) >= SHEET_READ_COLUMNS for row in rows):
-            text += f"\n[only rows 1-{SHEET_READ_ROWS} and columns A-Z of the sheet were read]"
-        return text
+        prev = previous or {}
+        own_row, own = int(prev.get("row") or 0), str(prev.get("text") or "")
+        lines = []
+        for number, row in enumerate(rows, 1):
+            cells = row[1:] if number == own_row and own and row[:1] == [own] else row
+            line = ", ".join(c for c in cells if c.strip())
+            if line:
+                lines.append(line)
+        return "\n".join([title, *lines, f"[read: the first sheet, rows 1-{SHEET_READ_ROWS}, columns A-Z]"])
 
     def write(self, sheet_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
         name, grid_id = self._first(sheet_id)
         lines = sheet_lines(block_text, self.shortened)
-        row = int((previous or {}).get("row") or 0)
-        # Sheets has no conditional write: the cell is checked, then rewritten in one atomic batchUpdate
-        # right after, so the owner's edit can only be lost inside that single round trip.
-        if row and self._values(sheet_id, f"{quote_sheet(name)}!A{row}") == [[(previous or {}).get("text", "")]]:
-            status = self._replace(sheet_id, grid_id, row, lines)
-            return status, ({"row": row, "text": lines[0]} if len(lines) == 1 else {})
+        prev = previous or {}
+        row, own = int(prev.get("row") or 0), str(prev.get("text") or "")
+        if row and own and self._values(sheet_id, f"{quote_sheet(name)}!A{row}") == [[own]]:
+            status, ours = self._replace(sheet_id, grid_id, row, own, lines)
+            if ours:
+                return status, ({"row": row, "text": lines[0]} if len(lines) == 1 else {})
+            # The owner changed our cell in the instant between the check and the write. It stays as it is;
+            # the other lines are already below it, and the first one goes right above them.
+            self._batch(sheet_id, self._insert_rows(grid_id, row, lines[:1]))
+            return status, {}
         return self._append(sheet_id, name, lines)
 
-    def _replace(self, sheet_id: str, grid_id: int, row: int, lines: List[str]) -> int:
-        """Our one-row block at ``row`` becomes ``lines`` in one batchUpdate (all or nothing): rows are
-        inserted below it, then the cells get the lines as plain strings, never parsed as formulas."""
-        requests: List[dict] = []
-        if len(lines) > 1:
-            requests.append({"insertDimension": {"range": {"sheetId": grid_id, "dimension": "ROWS",
-                                                           "startIndex": row, "endIndex": row + len(lines) - 1},
-                                                 "inheritFromBefore": True}})
-        requests.append({"updateCells": {
-            "start": {"sheetId": grid_id, "rowIndex": row - 1, "columnIndex": 0},
-            "rows": [{"values": [{"userEnteredValue": {"stringValue": line}}]} for line in lines],
-            "fields": "userEnteredValue"}})
-        return self.client.request("POST", f"{SHEETS}/{_quote(sheet_id)}:batchUpdate",
-                                   body={"requests": requests}).status
+    def _replace(self, sheet_id: str, grid_id: int, row: int, own: str, lines: List[str]) -> Tuple[int, bool]:
+        """Our one-row block at ``row`` becomes ``lines`` in one batchUpdate (all or nothing). The first line
+        replaces our cell through findReplace, which matches only while the cell holds exactly our text: the
+        server compares and writes in one step, so an edit of the owner is never written over. The other
+        lines go into rows inserted below. Returns the HTTP status and whether our cell was still ours."""
+        cell = {"sheetId": grid_id, "startRowIndex": row - 1, "endRowIndex": row,
+                "startColumnIndex": 0, "endColumnIndex": 1}
+        swap = {"findReplace": {"find": own, "replacement": lines[0], "range": cell, "matchCase": True,
+                                "matchEntireCell": True, "searchByRegex": False, "includeFormulas": False}}
+        resp = self._batch(sheet_id, [swap, *self._insert_rows(grid_id, row, lines[1:])])
+        replies = (resp.body or {}).get("replies") or [{}]
+        changed = int(((replies[0] or {}).get("findReplace") or {}).get("occurrencesChanged") or 0)
+        return resp.status, changed > 0
+
+    @staticmethod
+    def _insert_rows(grid_id: int, below_row: int, lines: List[str]) -> List[dict]:
+        """Requests that put ``lines`` into new rows right below 1-based ``below_row``, as plain strings
+        never parsed as formulas; nothing existing is written over."""
+        if not lines:
+            return []
+        return [{"insertDimension": {"range": {"sheetId": grid_id, "dimension": "ROWS", "startIndex": below_row,
+                                               "endIndex": below_row + len(lines)}, "inheritFromBefore": True}},
+                {"updateCells": {"start": {"sheetId": grid_id, "rowIndex": below_row, "columnIndex": 0},
+                                 "rows": [{"values": [{"userEnteredValue": {"stringValue": line}}]} for line in lines],
+                                 "fields": "userEnteredValue"}}]
+
+    def _batch(self, sheet_id: str, requests: List[dict]) -> Response:
+        return self.client.request("POST", f"{SHEETS}/{_quote(sheet_id)}:batchUpdate", body={"requests": requests})
 
     def _append(self, sheet_id: str, name: str, lines: List[str]) -> Tuple[int, Locator]:
         target = f"{quote_sheet(name)}!A1"

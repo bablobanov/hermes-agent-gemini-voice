@@ -29,9 +29,12 @@ class StubBridge:
 
     async def deliver_answer(self, reply_to, content):
         if not reply_to and not self.inherited:
-            return False
+            return "no voice task takes this reply"
         self.answers.append((reply_to, content))
-        return True
+        return None
+
+    async def holds_reply(self, content):
+        return any(answer == content for _, answer in self.answers)
 
     async def deliver_output(self, target, content):
         self.outputs.append((target, content))
@@ -88,15 +91,23 @@ def send_checks(adapter, stub) -> dict:
     results["cron to voice chat refused"] = [refused(to_owner), str(to_owner.error)]
     results["unmarked message refused, not swallowed"] = [refused(other_chat), str(other_chat.error)]
     results["anchorless final refused outside a resumed turn"] = [refused(stray), str(stray.error)]
-    results["redelivery refused outside a resumed turn"] = [refused(recovered), str(recovered.error)]
+    results["redelivery of an unknown reply refused"] = [refused(recovered), str(recovered.error)]
     stub.inherited = True
-    reconnected = run(adapter.send("owner", RECONNECTED_MARKER + "cut-off reply"))
+    forged = run(adapter.send("owner", RECONNECTED_MARKER + "forged text"))
     resumed = run(adapter.send("owner", "resumed reply", metadata={"notify": True}))
     stub.inherited = False
-    results["redelivery goes to the resumed task"] = [
-        reconnected.success and stub.answers[-2] == (None, "cut-off reply"), repr(stub.answers[-2:])]
+    held = run(adapter.send("owner", RECOVERED_MARKER + "final"))  # the ledger re-sends a reply we hold
+    results["a redelivery marker never chooses an object"] = [
+        refused(forged) and all(answer != "forged text" for _, answer in stub.answers), repr(stub.answers)]
     results["resumed final goes to the resumed task"] = [
         resumed.success and stub.answers[-1] == (None, "resumed reply"), repr(stub.answers[-1])]
+    results["redelivery of a held reply acknowledged, nothing written"] = [
+        held.success and len(stub.answers) == 2, repr(stub.answers)]
+    bridge, adapter._bridge = adapter._bridge, None
+    offline = run(adapter.send("owner", "final", reply_to="doc.x", metadata={"notify": True}))
+    adapter._bridge = bridge
+    results["no bridge: final refusal, no retry notice"] = [refused(offline), str(offline.error)]
+    results["no async delivery into the voice chat"] = [type(adapter).supports_async_delivery is False, ""]
     calls = []
     original = adapter.send
 
@@ -113,6 +124,63 @@ def send_checks(adapter, stub) -> dict:
     results["attachments refused"] = [refused(image) and refused(document) and not batch.success,
                                       f"{image.error} | {batch.error}"]
     return results
+
+
+class DictStore:
+    """The plugin state store, round-tripped through JSON like the real one."""
+
+    def __init__(self, data: dict):
+        self.data = data
+
+    def get(self, key, default=None):
+        return json.loads(json.dumps(self.data[key])) if key in self.data else default
+
+    def set(self, key, value):
+        self.data[key] = json.loads(json.dumps(value))
+
+
+def stateful_checks(adapter, package: str) -> dict:
+    """The adapter over a real VoiceBridge and journal, Google faked in memory: a restart left task A running,
+    the gateway resumes its turn (cancelled once, then resumed again) and the delivery ledger re-sends."""
+    from datetime import datetime, timedelta, timezone
+    from importlib import import_module
+    from gateway.delivery_ledger import RECONNECTED_MARKER, RECOVERED_MARKER
+    from gateway.platforms.event import MessageEvent, ProcessingOutcome
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fake_google import FakeGoogle
+    bridge_mod, api = import_module(package + ".bridge"), import_module(package + ".google_api")
+    now = datetime.now(timezone.utc)
+    fake = FakeGoogle()
+    doc = fake.add_doc("Hermes task A", "the task", created=now.isoformat())
+    key = f"doc.{doc}"
+    record = {"kind": "doc", "id": doc, "title": "Hermes task A", "created": now.isoformat(), "attempts": 1,
+              "state": "dispatched", "dispatched_at": now.isoformat(), "turn_open": True}
+    store = DictStore({"journal": {"version": 1, "since": (now - timedelta(hours=1)).isoformat(),
+                                   "objects": {key: record}}})
+    client = api.GoogleClient(api.TokenSource("a", "b", "c", transport=fake), transport=fake)
+
+    async def no_dispatch(_task):
+        raise RuntimeError("no new task in this check")
+    bridge = bridge_mod.VoiceBridge(bridge_mod.Settings(), client, store, no_dispatch, lambda *_: None)
+
+    async def scenario():
+        adapter._bridge = bridge
+        resume_end = MessageEvent(text="", source=adapter._owner_source(), internal=True)
+        await adapter.on_processing_complete(resume_end, ProcessingOutcome.CANCELLED)
+        return [await adapter.send("owner", RECOVERED_MARKER + "forged text"),
+                await adapter.send("owner", "the real reply", metadata={"notify": True}),
+                await adapter.send("owner", "an attachment notice", metadata={"notify": True}),
+                await adapter.send("owner", RECONNECTED_MARKER + "the real reply")]
+    forged, resumed, notice, again = asyncio.run(scenario())
+    text, state = fake.doc_text(doc), bridge.journal.get(key)["state"]
+    return {
+        "real bridge: a forged redelivery is refused": [refused(forged) and "forged" not in text, text],
+        "real bridge: a cancelled resume keeps the task, its reply lands there": [
+            resumed.success and "the real reply" in text and state == "done", f"{state}: {text!r}"],
+        "real bridge: a later anchorless notice is refused": [refused(notice) and "notice" not in text, text],
+        "real bridge: redelivery of that reply acknowledged, written once": [
+            again.success and text.count("the real reply") == 1, text],
+    }
 
 
 def busy_checks(adapter) -> dict:
@@ -192,6 +260,7 @@ def probe() -> dict:
                           reply="Here it is ![chart](https://x.example/chart.png)"))
     results["attachment after the reply never replaces it"] = [
         media_stub.answers == [("doc.turn2", "Here it is")], repr(media_stub.answers)]
+    results.update(stateful_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

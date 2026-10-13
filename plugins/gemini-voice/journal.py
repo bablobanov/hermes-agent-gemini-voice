@@ -63,7 +63,7 @@ class Journal:
         data = store.get(STORE_KEY, None)
         self.data: Dict[str, Any] = data if isinstance(data, dict) and data.get("version") == VERSION else {}
         self.data.setdefault("version", VERSION)
-        for key, empty in (("objects", {}), ("outbound", {}), ("daily", {}), ("status", {})):
+        for key, empty in (("objects", {}), ("outbound", {}), ("daily", {}), ("status", {}), ("cursors", {})):
             if not isinstance(self.data.get(key), type(empty)):
                 self.data[key] = empty
 
@@ -88,6 +88,18 @@ class Journal:
         if now is not None:
             self.data["last_poll_ok"] = iso(now)
         self.data["cal_updated_min"] = iso(calendar_mark)
+        self.save()
+
+    def cursor(self, name: str) -> Optional[Dict[str, Any]]:
+        """A listing pass still in progress (its query bound and next page token), or None."""
+        value = self.data["cursors"].get(name)
+        return value if isinstance(value, dict) and value.get("token") else None
+
+    def set_cursor(self, name: str, value: Optional[Dict[str, Any]]) -> None:
+        if value:
+            self.data["cursors"][name] = value
+        elif self.data["cursors"].pop(name, None) is None:
+            return
         self.save()
 
     # -- objects ----------------------------------------------------------------------------------

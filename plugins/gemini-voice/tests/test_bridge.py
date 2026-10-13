@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from _load import load
-from fake_google import CAL, DRIVE, FakeGoogle
+from fake_google import CAL, DOCS, DRIVE, FakeGoogle
 
 api = load("google_api")
 bridge_mod = load("bridge")
@@ -227,7 +227,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
         await h.bridge.tick()
-        self.assertFalse(await h.bridge.deliver_answer("doc.someone-else", "x"))
+        self.assertIsNotNone(await h.bridge.deliver_answer("doc.someone-else", "x"))
 
 
 class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -251,16 +251,16 @@ class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         self.assertEqual(h.dispatched, [])
         self.assertEqual(h.state(a), "dispatched")
-        self.assertTrue(await h.bridge.deliver_answer(None, "работа прервалась, продолжить?"))
+        self.assertIsNone(await h.bridge.deliver_answer(None, "работа прервалась, продолжить?"))
         self.assertIn("продолжить?", h.fake.doc_text(a.split(".", 1)[1]))
         # an attachment notice after the reply must not replace it
-        self.assertFalse(await h.bridge.deliver_answer(None, "https://example.com/chart.png"))
+        self.assertIsNotNone(await h.bridge.deliver_answer(None, "https://example.com/chart.png"))
         self.assertNotIn("chart.png", h.fake.doc_text(a.split(".", 1)[1]))
         await h.bridge.on_turn_complete(None, "success")
         h.busy[0] = False
         await h.bridge.tick()
         self.assertEqual([t.key for t in h.dispatched], [b])
-        self.assertFalse(await h.bridge.deliver_answer(None, "без якоря"))
+        self.assertIsNotNone(await h.bridge.deliver_answer(None, "без якоря"))
         self.assertNotIn("без якоря", h.fake.doc_text(b.split(".", 1)[1]))
 
     async def test_after_a_long_outage_a_late_reply_never_lands_in_the_next_task(self):
@@ -269,7 +269,7 @@ class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         self.assertEqual(h.state(a), "abandoned")
         self.assertEqual([t.key for t in h.dispatched], [b])
-        self.assertFalse(await h.bridge.deliver_answer(None, "ответ первой"))
+        self.assertIsNotNone(await h.bridge.deliver_answer(None, "ответ первой"))
         self.assertNotIn("ответ первой", h.fake.doc_text(b.split(".", 1)[1]))
         await h.bridge.on_turn_complete(None, "success")  # an id-less turn end does not close B
         self.assertEqual(h.state(b), "dispatched")
@@ -279,10 +279,38 @@ class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
         await h.bridge.tick()
-        self.assertTrue(await h.bridge.deliver_answer(f"doc.{doc}", "настоящий ответ"))
-        self.assertFalse(await h.bridge.deliver_answer(None, "https://example.com/chart.png"))
+        self.assertIsNone(await h.bridge.deliver_answer(f"doc.{doc}", "настоящий ответ"))
+        self.assertIsNotNone(await h.bridge.deliver_answer(None, "https://example.com/chart.png"))
         self.assertIn("настоящий ответ", h.fake.doc_text(doc))
         self.assertNotIn("chart.png", h.fake.doc_text(doc))
+
+    async def test_a_cancelled_resumed_turn_keeps_its_task(self):
+        h, a, _ = await self.restarted()
+        h.busy[0] = True
+        await h.bridge.tick()
+        await h.bridge.on_turn_complete(None, "cancelled")  # the gateway may resume it once more
+        self.assertIsNone(await h.bridge.deliver_answer(None, "ответ после повторного продолжения"))
+        self.assertIn("повторного продолжения", h.fake.doc_text(a.split(".", 1)[1]))
+
+    async def test_only_replies_already_held_count_as_redelivered(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        self.assertFalse(await h.bridge.holds_reply("ответ"))
+        await h.bridge.deliver_answer(f"doc.{doc}", "ответ")
+        self.assertTrue(await h.bridge.holds_reply("ответ"))
+        self.assertFalse(await h.bridge.holds_reply("другой ответ"))
+
+    async def test_a_reply_google_refuses_for_good_is_not_reported_as_delivered(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        del h.fake.docs[doc]  # e.g. the owner deleted the document meanwhile
+        self.assertIsNotNone(await h.bridge.deliver_answer(f"doc.{doc}", "ответ"))
+        self.assertEqual(h.state(f"doc.{doc}"), "failed")
+        self.assertFalse(await h.bridge.holds_reply("ответ"))
 
 
 class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
@@ -300,7 +328,7 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
             await second.bridge.tick()
         self.assertEqual(second.dispatched, [])
         # the gateway resumes the interrupted turn; its reply arrives without an anchor
-        self.assertTrue(await second.bridge.deliver_answer(None, "работа прервалась перезапуском, продолжить?"))
+        self.assertIsNone(await second.bridge.deliver_answer(None, "работа прервалась перезапуском, продолжить?"))
         self.assertIn("продолжить?", first.fake.doc_text(doc))
         self.assertEqual(second.state(f"doc.{doc}"), "done")
 
@@ -389,6 +417,22 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.state(f"cal.{event}"), "rejected")
         self.assertEqual(h.dispatched, [])
 
+    async def test_a_lost_acknowledgement_response_does_not_reject_the_task(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True  # a long turn: the new event waits in the queue past the 10-minute edit window
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.later(minutes=15)
+        h.busy[0] = False
+        h.fake.lose_response_once = ("PATCH", CAL + "/")  # the acknowledgement lands, its response does not
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "queued")
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+        self.assertIn("купи хлеб", h.dispatched[0].prompt)
+        self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
+
     async def test_cancelled_turn_keeps_waiting_for_a_resume(self):
         h = Harness()
         await h.bridge.tick()
@@ -464,14 +508,40 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         h = Harness()
         h.fake.cal_page_size = 2  # five pages of two: ten changes per poll
         await h.bridge.tick()
-        for i in range(1, 13):
-            h.fake.add_event(f"встреча {i}", created=stamp(T0 + timedelta(minutes=15 * i)))
-        task = h.fake.add_event("Афоня после всплеска", created=stamp(T0 + timedelta(minutes=15 * 13)))
-        h.later(hours=4)
+        for i in range(1, 13):  # an import: twelve changes within four minutes, inside the 10-minute overlap
+            h.fake.add_event(f"встреча {i}", created=stamp(T0 + timedelta(seconds=20 * i)))
+        task = h.fake.add_event("Афоня после всплеска", created=stamp(T0 + timedelta(seconds=20 * 13)))
+        h.later(minutes=10)
         await h.bridge.tick()
         self.assertEqual(h.dispatched, [])  # this poll reached only the first ten changes
-        await h.bridge.tick()
+        await h.bridge.tick()  # the same pass goes on from its next page
         self.assertEqual([t.key for t in h.dispatched], [f"cal.{task}"])
+        self.assertIsNone(h.bridge.journal.cursor("calendar"))
+
+    async def test_more_new_files_than_one_poll_reads_are_all_seen(self):
+        h = Harness()
+        h.fake.drive_page_size = 1  # five pages of one: five files per poll, newest first
+        await h.bridge.tick()
+        task = h.fake.add_doc("Афоня самая первая", "x", created=h.later(minutes=1))
+        for i in range(6):
+            h.fake.add_doc(f"заметка {i}", "y", created=h.later(minutes=1))
+        await h.bridge.tick()
+        self.assertEqual(h.dispatched, [])
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
+
+    async def test_google_not_answering_for_one_task_does_not_hold_up_polling(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня документ", "x", created=h.later(minutes=1))
+        event = h.fake.add_event("Афоня событие", created=h.later(minutes=1))
+        h.fake.offline_urls = [DOCS]  # only the Docs API times out
+        delays = [await h.bridge.tick() for _ in range(3)]
+        self.assertEqual(delays, [60.0, 60.0, 60.0])  # no back-off: Calendar and Drive answer
+        self.assertEqual(h.statuses[-1], ("retrying", "google_unreachable"))
+        self.assertEqual(h.state(f"doc.{doc}"), "failed")  # three attempts, then given up
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
 
     async def test_a_broken_state_file_is_reported_and_the_poller_survives(self):
         h = Harness()

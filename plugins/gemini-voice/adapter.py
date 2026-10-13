@@ -20,9 +20,8 @@ from .google_api import GoogleClient, TokenSource
 logger = logging.getLogger("gemini_voice")
 
 OWNER_NAME = "Owner (Gemini voice)"
-# Every redelivery marker of the gateway's delivery ledger starts like this (gateway/delivery_ledger.py):
-# a final reply that was cut off by a restart, a reconnect or a rate limit, sent again without its anchor.
-RECOVERED_PREFIX = "♻️ Recovered reply"
+# Every redelivery line of the gateway's delivery ledger starts like this (gateway/delivery_ledger.py).
+LEDGER_MARKER = "♻️ Recovered reply"
 # Prefix of this adapter's refusals: final, never retried, never re-sent as plain text.
 REFUSED = "gemini-voice: "
 NOT_A_TARGET = ("the voice chat only takes the final reply of a voice task; deliver to gemini_voice:doc "
@@ -38,11 +37,11 @@ def _refuse(reason: str) -> SendResult:
     return SendResult(success=False, error=REFUSED + reason, retryable=False)
 
 
-def _strip_recovered(content: str) -> Optional[str]:
-    """The reply inside a delivery-ledger redelivery, or None when ``content`` is not one."""
-    if not content.startswith(RECOVERED_PREFIX):
-        return None
-    return content.split("\n\n", 1)[1] if "\n\n" in content else ""
+def _without_ledger_marker(content: str) -> str:
+    """``content`` without the delivery ledger's redelivery line, if it starts with one."""
+    if content.startswith(LEDGER_MARKER) and "\n\n" in content:
+        return content.split("\n\n", 1)[1]
+    return content
 
 
 def _log_poller_end(task: "asyncio.Task[Any]") -> None:
@@ -101,11 +100,20 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Success means the text is in the journal and will be written into a Google object. Anything the
-        voice chat cannot take is refused for good (see ``_send_retry_is_final``), never reported as sent."""
+        voice chat cannot take is refused for good (see ``_send_retry_is_final``), never reported as sent.
+
+        Only the gateway's own turn delivery marks a final reply (``notify``). The delivery ledger's
+        redeliveries carry no such mark and look exactly like ``send_message`` from another chat (the
+        "Recovered reply" marker is plain text anyone can write), so they never choose an object: one that
+        repeats a reply this plugin already holds is acknowledged, so the ledger stops; any other is
+        refused. A reply lost in the instant between the turn and this adapter ends as the task's "did not
+        finish" note."""
         meta = metadata or {}
         bridge = self._bridge
         if bridge is None:
-            return SendResult(success=False, error="gemini-voice is not connected", retryable=True)
+            # Between a disconnect and the next connect. Final on purpose: retries would end in the engine's
+            # "delivery failed" notice, sent with the same anchor and written as the task's reply.
+            return _refuse("gemini-voice is not connected")
         if str(chat_id) != OWNER_CHAT:
             ok, ref = await bridge.deliver_output(str(chat_id), content)
             return SendResult(success=ok, message_id=ref if ok else None, error=None if ok else ref)
@@ -116,14 +124,13 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
             return _refuse("approval prompts cannot be answered on the voice channel")
         if meta.get("_interim_send"):
             return SendResult(success=True, message_id=_message_id())  # mid-turn status: not shown here by design
-        recovered = None if meta.get("notify") else _strip_recovered(content)
-        if meta.get("notify"):  # the final reply of a turn; anchorless only for a turn resumed after a restart
-            ok = await bridge.deliver_answer(reply_to, content)
-        elif recovered is not None:  # a final reply the delivery ledger sends again, without its anchor
-            ok = await bridge.deliver_answer(None, recovered)
-        else:  # e.g. send_message from another chat, or a turn-error notice
+        if not meta.get("notify"):  # a ledger redelivery, send_message from another chat, a turn-error notice
+            if await bridge.holds_reply(_without_ledger_marker(content)):
+                return SendResult(success=True, message_id=_message_id())  # already in the journal: nothing to do
             return _refuse(NOT_A_TARGET)
-        return SendResult(success=True, message_id=_message_id()) if ok else _refuse("no voice task takes this reply")
+        # The final reply of a turn; without an anchor only for the turn resumed after a restart.
+        problem = await bridge.deliver_answer(reply_to, content)
+        return _refuse(problem) if problem else SendResult(success=True, message_id=_message_id())
 
     def _send_retry_is_final(self, result: SendResult) -> bool:
         """Our refusals are final: a retry or the plain-text fallback would only repeat them."""

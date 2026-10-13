@@ -6,6 +6,7 @@ variables; access tokens live only in this process's memory.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -27,6 +28,8 @@ _EXPIRY_MARGIN = 60.0
 _AUTH_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client", "invalid_scope"}
 _RATE_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "RATE_LIMIT_EXCEEDED", "quotaExceeded"}
 _DISABLED_REASONS = {"accessNotConfigured", "SERVICE_DISABLED"}
+# A dropped connection can surface while the body is read (http.client.IncompleteRead), not only as OSError.
+_NETWORK_ERRORS = (OSError, http.client.HTTPException)
 _SCOPE_REASONS = {"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}
 
 # (method, url, headers, body, timeout) -> (status, headers, body)
@@ -64,7 +67,8 @@ class Response:
 def urllib_transport(
     method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float,
 ) -> Tuple[int, Dict[str, str], bytes]:
-    """Plain HTTPS request; HTTP errors come back as a status, network errors raise ``OSError``."""
+    """Plain HTTPS request; HTTP errors come back as a status, network errors raise ``OSError`` or
+    ``http.client.HTTPException`` (a connection dropped while the body is read)."""
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
@@ -128,7 +132,7 @@ class TokenSource:
         headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
         try:
             status, _, raw = self._transport("POST", TOKEN_URL, headers, body, self._timeout)
-        except OSError as exc:
+        except _NETWORK_ERRORS as exc:
             raise TransientError("network", type(exc).__name__) from None
         payload = _parse_json(raw)
         if status == 200 and isinstance(payload, dict) and payload.get("access_token"):
@@ -175,7 +179,7 @@ class GoogleClient:
               data: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
         try:
             return self._transport(method, url, headers, data, self._timeout)
-        except OSError as exc:
+        except _NETWORK_ERRORS as exc:
             raise TransientError("network", type(exc).__name__) from None
 
     @staticmethod
@@ -186,7 +190,7 @@ class GoogleClient:
         reasons, message = _error_reasons(body)
         if status == 401:
             raise AuthError("unauthorized", message, status)
-        if status == 429 or status >= 500 or (status == 403 and _RATE_REASONS.intersection(reasons)):
+        if status in (408, 429) or status >= 500 or (status == 403 and _RATE_REASONS.intersection(reasons)):
             raise TransientError(f"http_{status}", message, status)
         if status == 403 and _SCOPE_REASONS.intersection(reasons):
             raise AuthError("insufficient_scope", message, status)

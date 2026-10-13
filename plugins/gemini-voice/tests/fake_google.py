@@ -7,6 +7,7 @@ It enforces the contracts that matter to the plugin: ``If-Match`` etags on event
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -48,9 +49,12 @@ class FakeGoogle:
         self.revoked = False
         self.offline = False
         self.fail_writes = False
-        self.fail_cell_writes = False  # writing cell values fails (a values PUT, or a batchUpdate with updateCells)
+        self.fail_cell_writes = False  # writing cell values fails (a values PUT, or a batchUpdate that writes cells)
+        self.before_sheet_batch: Optional[Callable[[str], None]] = None
+        self.lose_response_once: Optional[Tuple[str, str]] = None  # (method, URL prefix)
         self.offline_urls: List[str] = []  # URL prefixes that time out, e.g. one Google API down
         self.cal_page_size = 250
+        self.drive_page_size = 100
         self.refuse: Dict[Tuple[str, str], Tuple[int, str]] = {}  # (method, url) -> (status, reason)
         self.reject_access_once = False
         self.token_scope = ALL_SCOPES
@@ -129,7 +133,12 @@ class FakeGoogle:
         if (method, base) in self.refuse:
             status, reason = self.refuse[(method, base)]
             return _error(status, reason)
-        return self._route(method, base, params, payload, headers)
+        reply = self._route(method, base, params, payload, headers)
+        if self.lose_response_once and self.lose_response_once[0] == method \
+                and base.startswith(self.lose_response_once[1]):
+            self.lose_response_once = None
+            raise OSError("timed out")  # Google applied the request; its answer never arrived
+        return reply
 
     def _token(self, form: Dict[str, str]) -> Reply:
         self.refreshes += 1
@@ -197,8 +206,18 @@ class FakeGoogle:
         return _json(200, event)
 
     # ------------------------------------------------------------------ drive
-    def _drive_list(self, _tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
-        return _json(200, {"files": list(self.files.values())})
+    def _drive_list(self, _tail: str, params: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
+        items = list(self.files.values())
+        after = re.search(r"createdTime > '([^']+)'", params.get("q", ""))
+        if after:
+            items = [f for f in items if _when(f["createdTime"]) > _when(after.group(1) + "+00:00")]
+        items.sort(key=lambda f: _when(f["createdTime"]), reverse=True)
+        start = int(params.get("pageToken") or 0)
+        size = min(int(params.get("pageSize") or 100), self.drive_page_size)
+        page = {"files": items[start:start + size]}
+        if start + size < len(items):
+            page["nextPageToken"] = str(start + size)
+        return _json(200, page)
 
     def _drive_get(self, tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
         item = self.files.get(urllib.parse.unquote(tail))
@@ -266,30 +285,44 @@ class FakeGoogle:
         cell = rows[row - 1][:1] if row - 1 < len(rows) and rows[row - 1] else []
         return _json(200, {"values": [cell]} if cell else {})
 
+    def _sheet_request(self, rows: List[List[str]], request: Dict[str, Any]) -> Dict[str, Any]:
+        if "insertDimension" in request:
+            rng = request["insertDimension"]["range"]
+            assert rng["sheetId"] == 7 and rng["dimension"] == "ROWS", request
+            for _ in range(rng["endIndex"] - rng["startIndex"]):
+                rows.insert(rng["startIndex"], [])
+            return {}
+        if "findReplace" in request:  # whole-cell, case-sensitive, literal: a compare-and-swap on one cell
+            swap = request["findReplace"]
+            rng, index = swap["range"], swap["range"]["startRowIndex"]
+            assert rng["sheetId"] == 7 and rng["endRowIndex"] == index + 1 and swap["matchEntireCell"], request
+            assert swap["matchCase"] and not swap["searchByRegex"], request
+            if index < len(rows) and rows[index][:1] == [swap["find"]]:
+                rows[index][0] = swap["replacement"]
+                self.sheet_writes.append({"valueInputOption": "RAW", "body": {"values": [[swap["replacement"]]]}})
+                return {"findReplace": {"occurrencesChanged": 1, "valuesChanged": 1}}
+            return {"findReplace": {}}
+        update = request["updateCells"]
+        assert update["start"]["sheetId"] == 7 and update["fields"] == "userEnteredValue", request
+        values = [[c["userEnteredValue"]["stringValue"] for c in r["values"]] for r in update["rows"]]
+        self.sheet_writes.append({"valueInputOption": "RAW", "body": {"values": values}})
+        for offset, row in enumerate(values):
+            index = update["start"]["rowIndex"] + offset
+            while len(rows) <= index:
+                rows.append([])
+            rows[index] = list(row)
+        return {}
+
     def _sheet_post(self, tail: str, params: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
         if tail.endswith(":batchUpdate"):
             sheet_id = urllib.parse.unquote(tail).split(":")[0]
             requests = (payload or {}).get("requests") or []
-            if self.fail_cell_writes and any("updateCells" in r for r in requests):
+            if self.before_sheet_batch:
+                self.before_sheet_batch(sheet_id)  # e.g. the owner edits a cell right before our write lands
+            if self.fail_cell_writes and any("updateCells" in r or "findReplace" in r for r in requests):
                 return _error(503, "backendError")  # batchUpdate is all or nothing: nothing applied
             rows = self.sheets[sheet_id]
-            for request in requests:
-                if "insertDimension" in request:
-                    rng = request["insertDimension"]["range"]
-                    assert rng["sheetId"] == 7 and rng["dimension"] == "ROWS", request
-                    for _ in range(rng["endIndex"] - rng["startIndex"]):
-                        rows.insert(rng["startIndex"], [])
-                    continue
-                update = request["updateCells"]
-                assert update["start"]["sheetId"] == 7 and update["fields"] == "userEnteredValue", request
-                values = [[c["userEnteredValue"]["stringValue"] for c in r["values"]] for r in update["rows"]]
-                self.sheet_writes.append({"valueInputOption": "RAW", "body": {"values": values}})
-                for offset, row in enumerate(values):
-                    index = update["start"]["rowIndex"] + offset
-                    while len(rows) <= index:
-                        rows.append([])
-                    rows[index] = list(row)
-            return _json(200, {})
+            return _json(200, {"replies": [self._sheet_request(rows, r) for r in requests]})
         sheet_id, _, rest = tail.partition("/values/")
         assert rest.endswith(":append"), tail
         self.sheet_writes.append({"valueInputOption": params.get("valueInputOption"),
