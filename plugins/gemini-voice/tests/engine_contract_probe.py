@@ -1,0 +1,104 @@
+"""Contract probe run in a child process against a real Hermes checkout (see test_engine_contract.py).
+
+argv: <engine root> <plugin dir>. HERMES_HOME must point to an empty temporary directory.
+Prints one JSON object: {check name: [ok, detail]}.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+
+def install(plugin_dir: Path, home: Path) -> None:
+    shutil.copytree(plugin_dir, home / "plugins" / "gemini-voice",
+                    ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    (home / "config.yaml").write_text("plugins:\n  enabled:\n    - gemini-voice\n", encoding="utf-8")
+
+
+class StubBridge:
+    def __init__(self):
+        self.answers, self.outputs = [], []
+
+    async def deliver_answer(self, reply_to, content):
+        self.answers.append((reply_to, content))
+        return True
+
+    async def deliver_output(self, target, content):
+        self.outputs.append((target, content))
+        return True, "doc.stub"
+
+
+def probe() -> dict:
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager, get_pre_tool_call_directive
+    from gateway.platform_registry import platform_registry
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter, _reply_anchor_for_event
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import build_session_key
+    from gateway.delivery import DeliveryTarget
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    discover_plugins()
+    results: dict = {}
+    entry = platform_registry.get("gemini_voice")
+    results["platform registered"] = [entry is not None, repr(getattr(entry, "label", None))]
+    results["trusted inbound"] = [bool(getattr(entry, "trusted_inbound", False)), ""]
+    results["display tier minimal"] = [getattr(entry, "display_tier", "") == "minimal", getattr(entry, "display_tier", "")]
+    results["cron home env"] = [getattr(entry, "cron_deliver_env_var", "") == "GEMINI_VOICE_HOME_CHANNEL", ""]
+    results["platform enum"] = [Platform("gemini_voice").value == "gemini_voice", ""]
+    manager = get_plugin_manager()
+    results["cli command"] = ["gemini-voice" in manager._cli_commands, ""]
+
+    adapter = entry.adapter_factory(PlatformConfig(enabled=True))
+    results["adapter class"] = [isinstance(adapter, BasePlatformAdapter), type(adapter).__name__]
+    source = adapter.build_source(chat_id="owner", chat_type="dm", user_id="owner", message_id="doc.x")
+    key = build_session_key(source)
+    results["session key"] = [key == "agent:main:gemini_voice:dm:owner", key]
+    event = MessageEvent(text="t", source=source, message_id="doc.x", allow_gateway_control=False)
+    results["reply anchor"] = [_reply_anchor_for_event(event) == "doc.x", str(_reply_anchor_for_event(event))]
+    target = DeliveryTarget.parse("gemini_voice:event-0800")
+    results["delivery target"] = [target.platform.value == "gemini_voice" and target.chat_id == "event-0800", ""]
+
+    stub = StubBridge()
+    adapter._bridge = stub
+    final = asyncio.run(adapter.send("owner", "final", reply_to="doc.x", metadata={"notify": True}))
+    progress = asyncio.run(adapter.send("owner", "progress", metadata={"_interim_send": True}))
+    approval = asyncio.run(adapter.send("owner", "approve?", metadata={"is_approval_prompt": True}))
+    output = asyncio.run(adapter.send("event-0800", "digest", metadata={"notify": True, "job_id": "j"}))
+    results["final reply routed"] = [final.success and stub.answers == [("doc.x", "final")], repr(stub.answers)]
+    results["progress dropped"] = [progress.success and len(stub.answers) == 1, ""]
+    results["approval refused"] = [approval.success is False, str(approval.error)]
+    results["cron output routed"] = [output.success and stub.outputs == [("event-0800", "digest")], repr(stub.outputs)]
+
+    tokens = set_session_vars(platform="gemini_voice")
+    try:
+        voice = get_pre_tool_call_directive("clarify", {})
+        other_tool = get_pre_tool_call_directive("web_search", {})
+    finally:
+        clear_session_vars(tokens)
+    tokens = set_session_vars(platform="telegram")
+    try:
+        telegram = get_pre_tool_call_directive("clarify", {})
+    finally:
+        clear_session_vars(tokens)
+    results["clarify blocked on voice"] = [voice[0] == "block", str(voice[0])]
+    results["other tools untouched"] = [other_tool[0] is None, str(other_tool[0])]
+    results["clarify allowed elsewhere"] = [telegram[0] is None, str(telegram[0])]
+    return results
+
+
+def main() -> int:
+    engine_root, plugin_dir = Path(sys.argv[1]), Path(sys.argv[2])
+    sys.path.insert(0, str(engine_root))
+    install(plugin_dir, Path(os.environ["HERMES_HOME"]))
+    print(json.dumps(probe(), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

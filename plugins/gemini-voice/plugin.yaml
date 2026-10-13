@@ -1,0 +1,66 @@
+name: gemini-voice
+label: Gemini Voice
+kind: platform
+version: 0.1.0
+description: >
+  Voice tasks from the Gemini app on your phone: say "create a document: Hermes, ..." (or an event, or a
+  sheet), Hermes does the task and writes the reply into that same Google object, and Gemini reads it
+  aloud. Uses the plugin's own Google OAuth token and only objects the account owner created.
+author: Ilya Balobanov
+license: MIT
+homepage: https://github.com/bablobanov/hermes-agent-gemini-voice
+requires_hermes: ">=0.21.6"
+provides_hooks:
+  - pre_tool_call
+requires_env:
+  - name: GEMINI_VOICE_CLIENT_ID
+    description: "OAuth client ID of your own Google Cloud project (Desktop app client)"
+    prompt: "Google OAuth client ID"
+    url: "https://console.cloud.google.com/apis/credentials"
+    password: false
+  - name: GEMINI_VOICE_CLIENT_SECRET
+    description: "OAuth client secret of the same client"
+    prompt: "Google OAuth client secret"
+    password: true
+  - name: GEMINI_VOICE_REFRESH_TOKEN
+    description: "The plugin's own refresh token, written by `hermes gemini-voice auth`"
+    prompt: "Refresh token (leave empty and run `hermes gemini-voice auth`)"
+    password: true
+optional_env:
+  - name: GEMINI_VOICE_HOME_CHANNEL
+    description: "Where `deliver: gemini_voice` cron output goes: doc (a new document, default) or event-HHMM"
+    prompt: "Default cron delivery target"
+    password: false
+config_schema:
+  labels:
+    type: list
+    default: [Hermes]
+    description: "Words that mark a title as a task for Hermes (whole word, any case)"
+  language:
+    type: str
+    default: en
+    description: "Language of the plugin's own status lines: en or ru"
+  timezone:
+    type: str
+    default: UTC
+    description: "IANA time zone for status times and event-HHMM delivery, e.g. Europe/Berlin"
+  poll_seconds:
+    type: int
+    default: 60
+    description: "Polling interval, 30-3600 seconds"
+  max_age_hours:
+    type: int
+    default: 24
+    description: "Objects older than this are never treated as tasks"
+  answer_timeout_minutes:
+    type: int
+    default: 40
+    description: "A task with no reply after this is closed with a note"
+  max_tasks_per_day:
+    type: int
+    default: 30
+    description: "Daily cap on tasks started from the voice channel"
+  sources:
+    type: list
+    default: [calendar, docs, sheets]
+    description: "Which Google object types are watched"

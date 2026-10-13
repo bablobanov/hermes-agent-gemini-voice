@@ -1,0 +1,116 @@
+"""Hermes Agent Gemini Voice: tasks dictated to the Gemini app on a phone reach Hermes through the owner's
+own Google Calendar, Docs and Sheets; the reply is written into the same object for Gemini to read aloud.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict, Optional
+
+from .auth_cli import ENV_NAMES, default_io, handle, setup_parser
+from .bridge import PLATFORM, Settings, Task, VoiceBridge
+
+logger = logging.getLogger("gemini_voice")
+
+HOME_CHANNEL_ENV = "GEMINI_VOICE_HOME_CHANNEL"
+
+PLATFORM_HINT = (
+    "This chat is the owner's voice channel. Each message is a task the owner dictated to the Gemini app "
+    "on their phone, which saved it as a Google Calendar event, Doc or Sheet in the owner's own account. "
+    "Your final reply is written into that same Google object and read aloud by Gemini when the owner "
+    "asks, so reply in plain text without Markdown, briefly enough to listen to (about 150 words unless "
+    "the task asks for more), in the language of the task. You cannot ask a clarifying question in the "
+    "middle of a turn: make a reasonable assumption, or put the question in your final reply. Whenever "
+    "your rules require the owner's confirmation, ask for it in the final reply; the owner answers by "
+    "dictating a new task, which arrives in this same chat."
+)
+
+CLARIFY_BLOCK = (
+    "clarify is not available on the Gemini voice channel: the owner cannot answer in the middle of a "
+    "turn. Make a reasonable assumption, or ask your question in the final reply; the owner will answer "
+    "with a new voice task in this chat."
+)
+
+
+def _read_secret(name: str) -> Optional[str]:
+    """The plugin's own credential by environment name, through Hermes's profile-scoped secret reader."""
+    try:
+        from agent.secret_scope import get_secret
+        value = get_secret(name)
+    except ImportError:
+        value = os.environ.get(name)
+    except Exception as exc:  # e.g. no secret scope while multiplexing: treat as absent, say why
+        logger.warning("gemini-voice: cannot read %s: %s", name, type(exc).__name__)
+        return None
+    return str(value).strip() if value else None
+
+
+def _save_env(name: str, value: str) -> None:
+    from hermes_cli.config import save_env_value_secure
+    save_env_value_secure(name, value)
+
+
+def _is_connected(_config: Any = None) -> bool:
+    return all(_read_secret(name) for name in ENV_NAMES)
+
+
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    if not _is_connected():
+        return None
+    home = (_read_secret(HOME_CHANNEL_ENV) or "doc").strip()
+    return {"home_channel": {"chat_id": home, "name": "Google (new document)" if home == "doc" else f"Google {home}"}}
+
+
+def _session_platform() -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return str(get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+    except Exception:
+        return ""
+
+
+def _pre_tool_call(tool_name: str = "", **_: Any) -> Optional[Dict[str, str]]:
+    """Only change to the agent's tools: ``clarify`` cannot be answered from the phone mid-turn."""
+    if tool_name == "clarify" and _session_platform() == PLATFORM:
+        return {"action": "block", "message": CLARIFY_BLOCK}
+    return None
+
+
+def register(ctx: Any) -> None:
+    """Hermes plugin entry point."""
+    from .adapter import GeminiVoiceAdapter  # gateway imports stay inside Hermes
+
+    def settings() -> Settings:
+        return Settings.from_config(lambda key, default: ctx.get_config(key, default))
+
+    def factory(config: Any) -> GeminiVoiceAdapter:
+        return GeminiVoiceAdapter(config, settings=settings(), store=ctx.state, read_secret=_read_secret)
+
+    async def standalone_send(pconfig: Any, chat_id: str, message: str, **_: Any) -> Dict[str, Any]:
+        """Cron delivery when no gateway runs in this process."""
+        from .google_api import GoogleClient, TokenSource
+        credentials = [_read_secret(name) or "" for name in ENV_NAMES]
+        if not all(credentials):
+            return {"error": "gemini-voice is not configured; run `hermes gemini-voice auth`"}
+
+        async def _no_dispatch(_task: Task) -> None:
+            raise RuntimeError("standalone delivery cannot start tasks")
+
+        bridge = VoiceBridge(settings(), GoogleClient(TokenSource(*credentials)), ctx.state,
+                             _no_dispatch, lambda *_args: None)
+        ok, ref = await bridge.deliver_output(str(chat_id), message)
+        return {"success": True, "message_id": ref} if ok else {"error": ref}
+
+    ctx.register_platform(
+        name=PLATFORM, label="Gemini Voice (Google Calendar, Docs, Sheets)", adapter_factory=factory,
+        check_fn=lambda: True, is_connected=_is_connected, required_env=list(ENV_NAMES),
+        install_hint="Run `hermes gemini-voice auth` once on the server", trusted_inbound=True,
+        display_tier="minimal", platform_hint=PLATFORM_HINT, cron_deliver_env_var=HOME_CHANNEL_ENV,
+        standalone_sender_fn=standalone_send, env_enablement_fn=_env_enablement, emoji="🎙",
+        allow_update_command=False, max_message_length=0)
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_cli_command(
+        name="gemini-voice", help="Gemini voice channel: authorize, check, status",
+        setup_fn=setup_parser, handler_fn=lambda args: handle(args, default_io(_read_secret, _save_env), ctx.state),
+        description="Authorize the plugin's own Google access once, verify it, and show the channel status.")
