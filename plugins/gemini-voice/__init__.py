@@ -9,7 +9,7 @@ import os
 from typing import Any, Dict, Optional
 
 from .auth_cli import ENV_NAMES, default_io, handle, setup_parser
-from .bridge import OWNER_CHAT, PLATFORM, Settings, Task, VoiceBridge
+from .bridge import PLATFORM, TEXT_ONLY, Settings, Task, VoiceBridge, valid_target
 from .journal import NullStore
 
 logger = logging.getLogger("gemini_voice")
@@ -65,8 +65,9 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     if not _is_connected():
         return None
     home = (_read_secret(HOME_CHANNEL_ENV) or "doc").strip()
-    if home == OWNER_CHAT:
-        logger.warning("gemini-voice: %s=owner is not a delivery target; using doc", HOME_CHANNEL_ENV)
+    if not valid_target(home):
+        logger.warning("gemini-voice: %s=%r is not a delivery target (use doc or event-HHMM); using doc",
+                       HOME_CHANNEL_ENV, home)
         home = "doc"
     return {"home_channel": {"chat_id": home, "name": "Google (new document)" if home == "doc" else f"Google {home}"}}
 
@@ -96,10 +97,14 @@ def register(ctx: Any) -> None:
     def factory(config: Any) -> GeminiVoiceAdapter:
         return GeminiVoiceAdapter(config, settings=settings(), store=ctx.state, read_secret=_read_secret)
 
-    async def standalone_send(pconfig: Any, chat_id: str, message: str, **_: Any) -> Dict[str, Any]:
+    async def standalone_send(pconfig: Any, chat_id: str, message: str, *, media_files: Any = None,
+                              **_: Any) -> Dict[str, Any]:
         """Cron delivery when no gateway runs in this process. It never touches the gateway's journal
-        (NullStore): output documents are recognised by their signature line, not by the journal."""
+        (NullStore): output documents are recognised by their signature line, not by the journal. Text
+        only, like the live adapter: with attachments nothing is written, so nothing is half-delivered."""
         from .google_api import GoogleClient, TokenSource
+        if media_files:
+            return {"error": f"gemini-voice: {TEXT_ONLY}"}
         credentials = [_read_secret(name) or "" for name in ENV_NAMES]
         if not all(credentials):
             return {"error": "gemini-voice is not configured; run `hermes gemini-voice auth`"}

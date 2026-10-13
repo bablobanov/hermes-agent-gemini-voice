@@ -4,8 +4,11 @@
                  |            |-> abandoned (no answer within the timeout)
                  |            |-> failed (the turn errored)
                  |-> failed (could not read or acknowledge it)
+                 |-> queued (Google did not answer: retried later, with growing pauses)
     queued -> skipped (daily limit, waited too long, or it is the plugin's own output)
     queued -> rejected (ownership no longer holds when the task is about to start; nothing is written)
+
+A closing note Google cannot take at once is kept (``note_pending``) and written on a later poll.
 
 ``dispatched`` is written to disk *before* the task is handed to the gateway, and a dispatched task is
 never handed over again. A restart therefore cannot start a task twice: the gateway resumes the
@@ -91,9 +94,9 @@ class Journal:
         self.save()
 
     def cursor(self, name: str) -> Optional[Dict[str, Any]]:
-        """A listing pass still in progress (its query bound and next page token), or None."""
+        """Where a listing longer than one poll goes on (times, never page tokens), or None."""
         value = self.data["cursors"].get(name)
-        return value if isinstance(value, dict) and value.get("token") else None
+        return value if isinstance(value, dict) and value else None
 
     def set_cursor(self, name: str, value: Optional[Dict[str, Any]]) -> None:
         if value:
@@ -125,12 +128,28 @@ class Journal:
         self.save()
         return record
 
-    def next_queued(self) -> Optional[str]:
-        queued = [(r.get("created") or "", k) for k, r in self.objects.items() if r.get("state") == "queued"]
+    def update(self, key: str, **fields: Any) -> None:
+        """Change fields without a state transition; ``None`` removes a field."""
+        record = self.objects[key]
+        for name, value in fields.items():
+            if value is None:
+                record.pop(name, None)
+            else:
+                record[name] = value
+        self.save()
+
+    def next_queued(self, now: datetime) -> Optional[str]:
+        """The oldest queued task that is not waiting for a retry."""
+        queued = [(r.get("created") or "", k) for k, r in self.objects.items()
+                  if r.get("state") == "queued" and (from_iso(r.get("retry_at")) or now) <= now]
         return min(queued)[1] if queued else None
 
     def with_state(self, state: str) -> List[str]:
         return [k for k, r in self.objects.items() if r.get("state") == state]
+
+    def with_pending_note(self) -> List[str]:
+        """Closed tasks whose closing note Google has not taken yet."""
+        return [k for k, r in self.objects.items() if r.get("note_pending") and r.get("state") in FINAL_STATES]
 
     def open_turn(self) -> Optional[str]:
         """The task whose gateway turn may still be running (at most one at a time)."""

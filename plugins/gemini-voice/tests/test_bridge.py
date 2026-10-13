@@ -108,8 +108,10 @@ class VoiceTaskTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         self.assertEqual(h.dispatched[-1].key, f"sheet.{sheet}")
         await h.bridge.deliver_answer(f"sheet.{sheet}", "цапля принята")
-        self.assertEqual(h.fake.sheets[sheet][-1], ["цапля принята"])
-        self.assertEqual(h.fake.sheets[sheet][0], ["молоко", "хлеб"])
+        rows = h.fake.sheets[sheet]
+        self.assertEqual(rows[0], ["молоко", "хлеб"])
+        self.assertTrue(rows[1][0].startswith("[Hermes] ответ"))  # the reply took the acknowledgement's place
+        self.assertEqual(rows[2:], [["цапля принята"], []])  # and the acknowledgement's cell was emptied
 
     async def test_one_task_at_a_time_until_the_gateway_turn_ends(self):
         h = self.h
@@ -297,10 +299,12 @@ class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
         await h.bridge.tick()
         doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
         await h.bridge.tick()
-        self.assertFalse(await h.bridge.holds_reply("ответ"))
+        self.assertFalse(h.bridge.holds_reply("ответ"))
         await h.bridge.deliver_answer(f"doc.{doc}", "ответ")
-        self.assertTrue(await h.bridge.holds_reply("ответ"))
-        self.assertFalse(await h.bridge.holds_reply("другой ответ"))
+        self.assertTrue(h.bridge.holds_reply("ответ"))
+        self.assertFalse(h.bridge.holds_reply("другой ответ"))
+        h.later(hours=25)  # the delivery ledger gives up re-sending after a day: so does the match
+        self.assertFalse(h.bridge.holds_reply("ответ"))
 
     async def test_a_reply_google_refuses_for_good_is_not_reported_as_delivered(self):
         h = Harness()
@@ -310,7 +314,7 @@ class AnchorlessReplyTests(unittest.IsolatedAsyncioTestCase):
         del h.fake.docs[doc]  # e.g. the owner deleted the document meanwhile
         self.assertIsNotNone(await h.bridge.deliver_answer(f"doc.{doc}", "ответ"))
         self.assertEqual(h.state(f"doc.{doc}"), "failed")
-        self.assertFalse(await h.bridge.holds_reply("ответ"))
+        self.assertFalse(h.bridge.holds_reply("ответ"))
 
 
 class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
@@ -428,10 +432,75 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         h.fake.lose_response_once = ("PATCH", CAL + "/")  # the acknowledgement lands, its response does not
         await h.bridge.tick()
         self.assertEqual(h.state(f"cal.{event}"), "queued")
+        h.later(minutes=3)  # past the retry pause
         await h.bridge.tick()
         self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
         self.assertIn("купи хлеб", h.dispatched[0].prompt)
         self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
+
+    async def test_two_lost_acknowledgements_in_a_row_do_not_reject_the_task(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True  # a long turn: the new event waits in the queue past the 10-minute edit window
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.later(minutes=15)
+        h.busy[0] = False
+        h.fake.lose_response_once = ("PATCH", CAL + "/")  # the first acknowledgement lands, its response does not
+        await h.bridge.tick()
+        h.later(minutes=3)
+        h.fake.fail_writes = True  # the second one does not land at all
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "queued")
+        h.fake.fail_writes = False
+        h.later(minutes=5)
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+        self.assertIn("купи хлеб", h.dispatched[0].prompt)
+        self.assertNotIn("принял", h.dispatched[0].prompt)
+        self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
+
+    async def test_a_reply_waiting_behind_a_poll_is_journaled_before_it_waits(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        key = f"doc.{doc}"
+        await h.bridge._lock.acquire()  # a poll is in the middle of its Google calls
+        send = asyncio.create_task(h.bridge.deliver_answer(key, "ответ"))
+        await asyncio.sleep(0)
+        send.cancel()  # the gateway shuts down before the poll lets go
+        await asyncio.gather(send, return_exceptions=True)
+        h.bridge._lock.release()
+        self.assertEqual(h.state(key), "answered")  # the ledger's re-send after the restart is held
+        restarted = Harness(fake=h.fake, store=h.store)
+        restarted.now = h.now
+        self.assertTrue(restarted.bridge.holds_reply("ответ"))
+        await restarted.bridge.tick()
+        self.assertEqual(restarted.state(key), "done")
+        self.assertIn("ответ (", h.fake.doc_text(doc))
+
+    async def test_a_note_never_replaces_a_reply_that_arrived_while_it_was_written(self):
+        h = Harness(answer_timeout_minutes=40)
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        key = f"doc.{doc}"
+        h.busy[0] = False
+        h.later(minutes=41)
+        original = h.bridge._write
+
+        def reply_lands_meanwhile(record, block_text, intent=None):
+            h.bridge.journal.mark(key, "answered", h.now[0], answer="поздний ответ", reply_sha="x")
+            return original(record, block_text, intent)
+        h.bridge._write = reply_lands_meanwhile
+        await h.bridge._expire(h.now[0])  # the "did not finish" note is being written
+        h.bridge._write = original
+        self.assertEqual(h.state(key), "answered")
+        await h.bridge.tick()
+        self.assertEqual(h.state(key), "done")
+        self.assertIn("поздний ответ", h.fake.doc_text(doc))
+        self.assertNotIn("не завершено", h.fake.doc_text(doc))  # the reply replaced the note
 
     async def test_cancelled_turn_keeps_waiting_for_a_resume(self):
         h = Harness()
@@ -536,12 +605,73 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         doc = h.fake.add_doc("Афоня документ", "x", created=h.later(minutes=1))
         event = h.fake.add_event("Афоня событие", created=h.later(minutes=1))
         h.fake.offline_urls = [DOCS]  # only the Docs API times out
-        delays = [await h.bridge.tick() for _ in range(3)]
+        delays = []
+        for _ in range(3):
+            delays.append(await h.bridge.tick())
+            h.later(minutes=1)
         self.assertEqual(delays, [60.0, 60.0, 60.0])  # no back-off: Calendar and Drive answer
         self.assertEqual(h.statuses[-1], ("retrying", "google_unreachable"))
-        self.assertEqual(h.state(f"doc.{doc}"), "failed")  # three attempts, then given up
-        await h.bridge.tick()
+        self.assertEqual(h.state(f"doc.{doc}"), "queued")  # it waits for a retry, the event goes first
         self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+
+    async def test_a_short_outage_of_one_api_delays_a_task_but_does_not_fail_it(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня документ", "x", created=h.later(minutes=1))
+        h.fake.offline_urls = [DOCS]
+        for _ in range(5):  # five minutes of polls while the Docs API is down
+            await h.bridge.tick()
+            h.later(minutes=1)
+        self.assertEqual(h.state(f"doc.{doc}"), "queued")
+        self.assertEqual(h.bridge.journal.get(f"doc.{doc}")["attempts"], 2)  # retried after pauses, not every poll
+        h.fake.offline_urls = []
+        h.later(minutes=5)
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{doc}"])
+        self.assertEqual(h.statuses[-1], ("connected", ""))
+
+    async def test_a_task_given_up_during_an_outage_gets_its_note_once_google_is_back(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня документ", "x", created=h.later(minutes=1))
+        h.fake.offline_urls = [DOCS]
+        for _ in range(60):  # an hour of polls while the Docs API is down
+            await h.bridge.tick()
+            h.later(minutes=1)
+        self.assertEqual(h.state(f"doc.{doc}"), "failed")
+        self.assertEqual(h.fake.doc_text(doc), "x\n")  # nothing could be written yet
+        self.assertEqual(h.statuses[-1], ("retrying", "google_unreachable"))
+        h.fake.offline_urls = []
+        await h.bridge.tick()
+        self.assertIn("не получилось", h.fake.doc_text(doc))  # the owner is not left with a silent document
+        self.assertEqual(h.statuses[-1], ("connected", ""))
+        self.assertEqual(h.bridge.journal.with_pending_note(), [])
+
+    async def test_a_new_task_is_seen_at_once_however_many_files_the_window_holds(self):
+        h = Harness()
+        await h.bridge.tick()
+        for i in range(1300):  # e.g. files shared with the owner today
+            h.fake.add_doc(f"заметка {i}", "y", created=stamp(T0 + timedelta(seconds=i + 1)))
+        h.later(hours=1)
+        await h.bridge.tick()  # a walk over the whole window begins and takes several polls
+        task = h.fake.add_doc("Афоня новая", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
+
+    async def test_a_walk_over_older_files_goes_on_and_ends(self):
+        h = Harness()
+        h.fake.drive_page_size = 1
+        await h.bridge.tick()
+        old_task = h.fake.add_doc("Афоня давняя", "x", created=h.later(minutes=1))
+        for i in range(12):
+            h.fake.add_doc(f"заметка {i}", "y", created=h.later(minutes=1))
+        for _ in range(3):
+            await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{old_task}"])
+        self.assertIsNone(h.bridge.journal.cursor("drive"))
+        h.fake.refuse[("GET", DRIVE)] = (400, "invalid")  # Drive refuses: no walk is left half-way
+        await h.bridge.tick()
+        self.assertIsNone(h.bridge.journal.cursor("drive"))
 
     async def test_a_broken_state_file_is_reported_and_the_poller_survives(self):
         h = Harness()

@@ -14,7 +14,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 from . import textutil
 from .auth_cli import ENV_NAMES
-from .bridge import OWNER_CHAT, PLATFORM, Settings, Task, VoiceBridge
+from .bridge import OWNER_CHAT, PLATFORM, TEXT_ONLY, Settings, Task, VoiceBridge
 from .google_api import GoogleClient, TokenSource
 
 logger = logging.getLogger("gemini_voice")
@@ -26,7 +26,7 @@ LEDGER_MARKER = "♻️ Recovered reply"
 REFUSED = "gemini-voice: "
 NOT_A_TARGET = ("the voice chat only takes the final reply of a voice task; deliver to gemini_voice:doc "
                 "(a new document) or gemini_voice:event-HHMM (an event at that local time)")
-NO_ATTACHMENTS = "files, images and audio are not delivered on the voice channel; put the content into the text"
+NO_ATTACHMENTS = TEXT_ONLY
 
 
 def _message_id() -> str:
@@ -106,8 +106,8 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
         redeliveries carry no such mark and look exactly like ``send_message`` from another chat (the
         "Recovered reply" marker is plain text anyone can write), so they never choose an object: one that
         repeats a reply this plugin already holds is acknowledged, so the ledger stops; any other is
-        refused. A reply lost in the instant between the turn and this adapter ends as the task's "did not
-        finish" note."""
+        refused. A reply is journaled as soon as it reaches this adapter; one lost before that ends as the
+        task's "did not finish" note."""
         meta = metadata or {}
         bridge = self._bridge
         if bridge is None:
@@ -125,7 +125,7 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
         if meta.get("_interim_send"):
             return SendResult(success=True, message_id=_message_id())  # mid-turn status: not shown here by design
         if not meta.get("notify"):  # a ledger redelivery, send_message from another chat, a turn-error notice
-            if await bridge.holds_reply(_without_ledger_marker(content)):
+            if bridge.holds_reply(_without_ledger_marker(content)):
                 return SendResult(success=True, message_id=_message_id())  # already in the journal: nothing to do
             return _refuse(NOT_A_TARGET)
         # The final reply of a turn; without an anchor only for the turn resumed after a restart.

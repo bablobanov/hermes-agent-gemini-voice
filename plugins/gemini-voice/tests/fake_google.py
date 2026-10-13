@@ -211,6 +211,9 @@ class FakeGoogle:
         after = re.search(r"createdTime > '([^']+)'", params.get("q", ""))
         if after:
             items = [f for f in items if _when(f["createdTime"]) > _when(after.group(1) + "+00:00")]
+        before = re.search(r"createdTime < '([^']+)'", params.get("q", ""))
+        if before:
+            items = [f for f in items if _when(f["createdTime"]) < _when(before.group(1) + "+00:00")]
         items.sort(key=lambda f: _when(f["createdTime"]), reverse=True)
         start = int(params.get("pageToken") or 0)
         size = min(int(params.get("pageSize") or 100), self.drive_page_size)
@@ -299,6 +302,8 @@ class FakeGoogle:
             assert swap["matchCase"] and not swap["searchByRegex"], request
             if index < len(rows) and rows[index][:1] == [swap["find"]]:
                 rows[index][0] = swap["replacement"]
+                if not any(rows[index]):
+                    rows[index] = []  # an emptied cell: the row reads as empty, like in Sheets
                 self.sheet_writes.append({"valueInputOption": "RAW", "body": {"values": [[swap["replacement"]]]}})
                 return {"findReplace": {"occurrencesChanged": 1, "valuesChanged": 1}}
             return {"findReplace": {}}

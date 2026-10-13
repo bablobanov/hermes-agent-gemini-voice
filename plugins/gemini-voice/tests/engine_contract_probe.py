@@ -33,7 +33,7 @@ class StubBridge:
         self.answers.append((reply_to, content))
         return None
 
-    async def holds_reply(self, content):
+    def holds_reply(self, content):
         return any(answer == content for _, answer in self.answers)
 
     async def deliver_output(self, target, content):
@@ -183,6 +183,118 @@ def stateful_checks(adapter, package: str) -> dict:
     }
 
 
+def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
+    """The engine's own delivery ledger around a real VoiceBridge: a final reply cut off while a poll held the
+    bridge is still held after the restart (the boot re-send closes its row, the reply is written once), and
+    a re-send of a reply nobody holds is refused for good."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from importlib import import_module
+    from gateway import delivery_ledger as ledger
+    from gateway.config import PlatformConfig
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fake_google import FakeGoogle
+    bridge_mod, api = import_module(package + ".bridge"), import_module(package + ".google_api")
+    session, targets = "agent:main:gemini_voice:dm:owner", {("gemini_voice", "default"), ("gemini_voice", None)}
+    fake, store, now = FakeGoogle(), DictStore({}), [datetime.now(timezone.utc)]
+
+    async def dispatch(_task):
+        return None
+
+    async def inline(fn, *args):
+        return fn(*args)
+
+    def process():
+        adapter = adapter_factory(PlatformConfig(enabled=True))
+        client = api.GoogleClient(api.TokenSource("a", "b", "c", transport=fake), transport=fake)
+        adapter._bridge = bridge_mod.VoiceBridge(bridge_mod.Settings(labels=["Hermes"]), client, store, dispatch,
+                                                 lambda *_: None, clock=lambda: now[0], run_blocking=inline)
+        return adapter, adapter._bridge
+
+    def owe(key, text):  # what the gateway records before it sends a final reply
+        oid = ledger.compute_obligation_id(session, key, text)
+        ledger.record_obligation(obligation_id=oid, session_key=session, platform="gemini_voice", chat_id="owner",
+                                 thread_id=None, content=text)
+        ledger.mark_attempting(oid)
+        return oid
+
+    def die(oid):  # the process that owned the row is gone: the next boot claims it
+        with sqlite3.connect(home / "state.db") as conn:
+            conn.execute("UPDATE delivery_obligations SET owner_pid=999999, owner_started_at=NULL "
+                         "WHERE obligation_id=?", (oid,))
+
+    def row_state(oid):
+        with sqlite3.connect(home / "state.db") as conn:
+            return conn.execute("SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
+
+    async def boot_resend(adapter, oid):  # as _redeliver_claimed_obligations in gateway/run_startup.py
+        row = next(r for r in ledger.sweep_recoverable(deliverable_platforms={"gemini_voice"},
+                                                       deliverable_targets=targets) if r["obligation_id"] == oid)
+        content = row.get("marker", ledger.RECOVERED_MARKER) + row["content"] if row.get("needs_marker") else row["content"]
+        result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=None)
+        if result.success:
+            ledger.mark_delivered(oid)
+        else:
+            ledger.mark_failed(oid, str(result.error or ""))
+        return result
+
+    async def scenario():
+        adapter, bridge = process()
+        await bridge.tick()
+        now[0] += timedelta(minutes=1)
+        doc = fake.add_doc("Hermes task A", "what is 2+2", created=now[0].isoformat())
+        now[0] += timedelta(minutes=1)
+        await bridge.tick()
+        key = f"doc.{doc}"
+        oid = owe(key, "A: four")
+        await bridge._lock.acquire()  # a poll is in the middle of its Google calls
+        send = asyncio.create_task(adapter.send("owner", "A: four", reply_to=key, metadata={"notify": True}))
+        await asyncio.sleep(0.05)
+        send.cancel()  # a graceful shutdown cancels the turn's send
+        await asyncio.gather(send, return_exceptions=True)
+        bridge._lock.release()
+        die(oid)
+        adapter, bridge = process()
+        held = await boot_resend(adapter, oid)
+        now[0] += timedelta(minutes=1)
+        await bridge.tick()
+        stray_oid = owe(key, "B: a reply nobody holds")
+        die(stray_oid)
+        stray = await boot_resend(adapter, stray_oid)
+        return held, row_state(oid), stray, row_state(stray_oid), fake.doc_text(doc)
+    held, held_row, stray, stray_row, text = asyncio.run(scenario())
+    return {
+        "ledger: a reply cut off behind a poll is held, its row closed, written once": [
+            held.success and held_row == "delivered" and text.count("A: four") == 1, f"{held_row}: {text!r}"],
+        "ledger: a re-send nobody holds is refused for good, nothing written": [
+            refused(stray) and stray_row == "failed" and "nobody" not in text, f"{stray_row}: {stray.error}"],
+    }
+
+
+def cron_checks(entry) -> dict:
+    """Delivery outside the gateway takes text only, and the home channel must be a real target."""
+    from gateway.config import PlatformConfig
+    names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
+             "GEMINI_VOICE_REFRESH_TOKEN": "token", "GEMINI_VOICE_HOME_CHANNEL": "event-2561"}
+    saved = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    try:
+        enablement = entry.env_enablement_fn()
+        media = asyncio.run(entry.standalone_sender_fn(PlatformConfig(enabled=True), "doc", "digest",
+                                                       media_files=[("/tmp/chart.png", False)]))
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return {
+        "cron home channel must be a target": [enablement["home_channel"]["chat_id"] == "doc", repr(enablement)],
+        "cron outside the gateway refuses attachments": [
+            str(media.get("error", "")).startswith("gemini-voice: files") and not media.get("success"), repr(media)],
+    }
+
+
 def busy_checks(adapter) -> dict:
     """When the voice queue must wait: the restore gate and a live turn; a guard left by a dead turn not."""
     from types import SimpleNamespace
@@ -261,6 +373,9 @@ def probe() -> dict:
     results["attachment after the reply never replaces it"] = [
         media_stub.answers == [("doc.turn2", "Here it is")], repr(media_stub.answers)]
     results.update(stateful_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
+    results.update(ledger_checks(entry.adapter_factory, type(adapter).__module__.rsplit(".", 1)[0],
+                                 Path(os.environ["HERMES_HOME"])))
+    results.update(cron_checks(entry))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:
