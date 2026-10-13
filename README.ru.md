@@ -1,6 +1,6 @@
 # Hermes Agent Gemini Voice
 
-![Hermes Agent Gemini Voice](assets/hero.png)
+![Hermes Agent Gemini Voice: talk to your Hermes Agent from an Android phone with Gemini Live](assets/hermes-agent-gemini-live-voice-android.svg)
 
 [English](README.md) · [简体中文](README.zh-Hans.md) · [Безопасность](SECURITY.md) · [Изменения](CHANGELOG.md)
 
@@ -197,5 +197,7 @@ GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=
 - `plugins/gemini-voice/`: плагин (только стандартная библиотека, без зависимостей Python) и его тесты
 - [Изменения](CHANGELOG.md) · [Участие](CONTRIBUTING.md) · [Безопасность](SECURITY.md) · [Лицензия MIT](LICENSE)
 
-MIT © 2026 Ilya Balobanov. Независимая интеграция, не официальный продукт Google или Nous Research. Gemini и Google -
-товарные знаки Google LLC.
+MIT © 2026 Ilya Balobanov. Независимая интеграция, не официальный продукт Google или Nous Research. Android, Gemini и
+Google - товарные знаки Google LLC.
+
+The Android robot is reproduced or modified from work created and shared by Google and used according to terms described in the Creative Commons 3.0 Attribution License.
