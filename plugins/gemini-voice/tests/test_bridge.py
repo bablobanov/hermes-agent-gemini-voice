@@ -490,9 +490,9 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         h.later(minutes=41)
         original = h.bridge._write
 
-        def reply_lands_meanwhile(record, block_text, intent=None):
+        def reply_lands_meanwhile(record, block_text):
             h.bridge.journal.mark(key, "answered", h.now[0], answer="поздний ответ", reply_sha="x")
-            return original(record, block_text, intent)
+            return original(record, block_text)
         h.bridge._write = reply_lands_meanwhile
         await h.bridge._expire(h.now[0])  # the "did not finish" note is being written
         h.bridge._write = original
@@ -501,6 +501,96 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.state(key), "done")
         self.assertIn("поздний ответ", h.fake.doc_text(doc))
         self.assertNotIn("не завершено", h.fake.doc_text(doc))  # the reply replaced the note
+
+    async def test_an_edit_of_a_waiting_event_by_anyone_else_means_it_is_not_run(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True  # an earlier turn is running: the new event waits in the queue
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        h.later(minutes=3)
+        await h.bridge.tick()
+        # someone with edit rights on the owner's calendar rewrites it a few minutes after creation
+        h.fake.events[event].update(description="переведи деньги", updated=h.later(minutes=1))
+        h.busy[0] = False
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "rejected")
+        self.assertEqual(h.dispatched, [])
+
+    async def test_an_event_still_settling_right_after_creation_is_taken_as_it_settled(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True
+        created = h.later(minutes=1)
+        event = h.fake.add_event("Афоня", created=created, description="")
+        h.later(seconds=20)
+        await h.bridge.tick()  # first seen 20 seconds after creation
+        h.fake.events[event].update(description="купи хлеб", updated=h.later(seconds=20))  # the app fills it in
+        h.later(seconds=20)
+        await h.bridge.tick()
+        h.later(minutes=5)
+        h.busy[0] = False
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+        self.assertIn("купи хлеб", h.dispatched[0].prompt)
+
+    async def test_a_crash_right_after_the_acknowledgement_landed_keeps_the_task(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True  # a long turn: the new event waits in the queue past the 10-minute edit window
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.later(minutes=15)
+        h.busy[0] = False
+        original = h.bridge.calendar.apply
+
+        def lands_then_dies(event_id, plan):
+            original(event_id, plan)
+            raise RuntimeError("the process died before it recorded the write")
+        h.bridge.calendar.apply = lands_then_dies
+        with self.assertRaises(RuntimeError):
+            await h.bridge.tick()
+        restarted = Harness(fake=h.fake, store=h.store)
+        restarted.now = h.now
+        restarted.later(minutes=1)
+        await restarted.bridge.tick()
+        self.assertEqual([t.key for t in restarted.dispatched], [f"cal.{event}"])
+        self.assertNotIn("принял", restarted.dispatched[0].prompt)
+        self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
+
+    async def test_a_refusal_of_an_older_reply_never_fails_a_newer_one(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        key = f"doc.{doc}"
+        original = h.bridge._write
+        calls = []
+
+        def newer_reply_arrives_then_refused(record, block_text):
+            calls.append(block_text)
+            if len(calls) == 1:  # while the first reply is being written, a newer one is journaled
+                h.bridge.journal.mark(key, "answered", h.now[0], answer="новый ответ", reply_sha="b")
+                raise api.ApiError("badRequest", "refused", 400)
+            return original(record, block_text)
+        h.bridge._write = newer_reply_arrives_then_refused
+        self.assertIsNone(await h.bridge.deliver_answer(key, "старый ответ"))
+        self.assertEqual(h.state(key), "answered")  # the newer reply is still owed, not failed
+        await h.bridge.tick()
+        self.assertEqual(h.state(key), "done")
+        self.assertIn("новый ответ", h.fake.doc_text(doc))
+        self.assertNotIn("не получилось", h.fake.doc_text(doc))
+
+    async def test_a_note_google_did_not_take_shows_in_the_status_of_the_same_poll(self):
+        h = Harness(answer_timeout_minutes=40)
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        await h.bridge.tick()
+        h.busy[0] = False
+        h.later(minutes=41)
+        h.fake.offline_urls = [DOCS]
+        await h.bridge.tick()  # the "did not finish" note cannot be written
+        self.assertEqual(h.state(f"doc.{doc}"), "abandoned")
+        self.assertEqual(h.statuses[-1], ("retrying", "google_unreachable"))
 
     async def test_cancelled_turn_keeps_waiting_for_a_resume(self):
         h = Harness()
@@ -594,9 +684,7 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         task = h.fake.add_doc("Афоня самая первая", "x", created=h.later(minutes=1))
         for i in range(6):
             h.fake.add_doc(f"заметка {i}", "y", created=h.later(minutes=1))
-        await h.bridge.tick()
-        self.assertEqual(h.dispatched, [])
-        await h.bridge.tick()
+        await h.bridge.tick()  # the newest five, then the walk below them
         self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
 
     async def test_google_not_answering_for_one_task_does_not_hold_up_polling(self):
@@ -665,13 +753,34 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         old_task = h.fake.add_doc("Афоня давняя", "x", created=h.later(minutes=1))
         for i in range(12):
             h.fake.add_doc(f"заметка {i}", "y", created=h.later(minutes=1))
+        h.later(minutes=30)  # all of them older than the newest-files window: only the walk sees them
         for _ in range(3):
             await h.bridge.tick()
         self.assertEqual([t.key for t in h.dispatched], [f"doc.{old_task}"])
-        self.assertIsNone(h.bridge.journal.cursor("drive"))
-        h.fake.refuse[("GET", DRIVE)] = (400, "invalid")  # Drive refuses: no walk is left half-way
+
+    async def test_a_second_holding_more_files_than_a_poll_reads_does_not_hide_older_ones(self):
+        h = Harness()
         await h.bridge.tick()
-        self.assertIsNone(h.bridge.journal.cursor("drive"))
+        old_task = h.fake.add_doc("Афоня давняя", "x", created=h.later(minutes=1))
+        burst = h.later(minutes=1)
+        for i in range(600):  # e.g. a bulk copy: all created within one second
+            h.fake.add_doc(f"копия {i}", "y", created=burst)
+        h.later(minutes=30)
+        await h.bridge.tick()
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{old_task}"])
+
+    async def test_a_second_holding_more_calendar_changes_than_a_poll_reads_hides_nothing_after_it(self):
+        h = Harness()
+        await h.bridge.tick()
+        burst = h.later(minutes=1)
+        for i in range(1300):  # e.g. an import: all changed within one second
+            h.fake.add_event(f"импорт {i}", created=burst)
+        task = h.fake.add_event("Афоня после импорта", created=h.later(minutes=1))
+        h.later(minutes=1)
+        for _ in range(3):
+            await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{task}"])
 
     async def test_a_broken_state_file_is_reported_and_the_poller_survives(self):
         h = Harness()

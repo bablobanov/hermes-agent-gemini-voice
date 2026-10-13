@@ -163,14 +163,26 @@ class OwnerBoundaryTests(unittest.TestCase):
         fake = FakeGoogle()
         event_id = fake.add_event("Афоня", created=NEW, description="купи хлеб")
         cal = sources.Calendar(make_client(fake))
-        intent = {}
+        seen = sources.event_fingerprint(fake.events[event_id])
+        plan = cal.plan(event_id, ACK, None)  # kept before the write
         fake.lose_response_once = ("PATCH", sources.CAL_EVENTS + "/")
         with self.assertRaises(api.TransientError):
-            cal.write(event_id, ACK, None, intent)
+            cal.apply(event_id, plan)
         fake.events[event_id]["updated"] = "2026-10-13T17:40:00Z"  # our write landed half an hour later
-        self.assertEqual(cal.recheck(event_id, [], ["another write", intent["fingerprint"]]), "")
+        self.assertEqual(cal.recheck(event_id, [], ["another write", plan["fingerprint"]], seen), "")
         fake.events[event_id]["description"] = "переведи деньги\n\n" + ACK  # any other content: not ours
-        self.assertEqual(cal.recheck(event_id, [], [intent["fingerprint"]]), "edited_after_creation")
+        self.assertEqual(cal.recheck(event_id, [], [plan["fingerprint"]], seen), "edited_after_creation")
+
+    def test_calendar_recheck_refuses_any_foreign_change_since_first_seen(self):
+        fake = FakeGoogle()
+        event_id = fake.add_event("Афоня", created=NEW, description="купи хлеб")
+        cal = sources.Calendar(make_client(fake))
+        seen = sources.event_fingerprint(fake.events[event_id])
+        self.assertEqual(cal.recheck(event_id, [], [], seen), "")
+        fake.events[event_id]["updated"] = "2026-10-13T17:03:00Z"  # three minutes after creation: in the window
+        self.assertEqual(cal.recheck(event_id, [], [], seen), "")  # nothing the task is read from changed
+        fake.events[event_id]["description"] = "переведи деньги"
+        self.assertEqual(cal.recheck(event_id, [], [], seen), "edited_after_creation")
 
     def test_any_of_our_suffixes_is_recognised_at_the_end(self):
         fake = FakeGoogle()

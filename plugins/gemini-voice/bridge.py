@@ -17,7 +17,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from . import textutil
 from .google_api import ApiError, AuthError, GoogleClient, GoogleError, TransientError
 from .journal import Journal, Store, from_iso, iso
-from .sources import MAX_PAGES, Calendar, CalendarOutput, Docs, Drive, Locator, Sheets, Verdict, own_suffixes
+from .sources import (DEEP_PAGES, MAX_PAGES, Calendar, CalendarOutput, Docs, Drive, Locator, Sheets, Verdict,
+                      own_suffixes)
 
 logger = logging.getLogger("gemini_voice")
 
@@ -41,9 +42,28 @@ KEEP_INTENTS = 4
 NOTE_RETRY_WINDOW = timedelta(hours=24)
 # The gateway's delivery ledger re-sends a reply for at most a day (STALE_AFTER_SECONDS).
 REPLAY_WINDOW = timedelta(hours=24)
-HEAD_PAGES = 1
+# Drive: files created this recently are read on every poll (new tasks); older ones by the walk over the window.
+HEAD_WINDOW = timedelta(minutes=15)
+# An event's text may still settle this soon after creation (the Gemini app); later, any change by someone
+# other than the plugin means the task is not run (Google does not say who edited an event).
+SEEN_GRACE = timedelta(minutes=2)
 TEXT_ONLY = "files, images and audio are not delivered on the voice channel; put the content into the text"
 _SLOT = re.compile(r"^event-([01]\d|2[0-3])([0-5]\d)$")
+
+
+def _version(record: Dict[str, Any]) -> Tuple[Any, Any]:
+    """What identifies a record's moment: its state and the reply it holds."""
+    return record.get("state"), record.get("reply_sha")
+
+
+def _past_second(last: Optional[datetime], start: datetime) -> bool:
+    """Whether a calendar read got past the whole second it started from (else the next read repeats it)."""
+    return last is not None and last.replace(microsecond=0) > start.replace(microsecond=0)
+
+
+def _before_second(last: Optional[datetime], before: datetime) -> bool:
+    """Whether a Drive read got below the whole second it started from (else the next read repeats it)."""
+    return last is not None and last.replace(microsecond=0) < before.replace(microsecond=0)
 
 
 def valid_target(target: str) -> bool:
@@ -157,6 +177,7 @@ class VoiceBridge:
         self._backoff = 0.0
         self._status: Optional[Tuple[str, str]] = None
         self._logged_rejects: set = set()
+        self._note_errors: List[GoogleError] = []  # notes kept for a later poll: reported by this one
 
     # ------------------------------------------------------------------------------------ loop
     async def run_forever(self) -> None:
@@ -198,8 +219,13 @@ class VoiceBridge:
         try:
             async with self._lock:
                 self._ensure_recovered(now)
+                self._note_errors = []  # only notes kept during this poll speak for its status
                 problems, listings = await self._poll(now)
                 stalled = await self._advance(now)  # replies and the queue move on even when a listing failed
+                stalled, self._note_errors = stalled + self._note_errors, []
+                broken = next((e for e in stalled if isinstance(e, AuthError)), None)
+                if broken is not None:
+                    raise broken
         except AuthError as exc:
             return self._on_auth_error(exc, now)
         except TransientError as exc:
@@ -255,14 +281,18 @@ class VoiceBridge:
             start, started = max(not_before, mark - CALENDAR_SKEW), now
         try:
             found, last, cut = await self._run(self.calendar.candidates, self._patterns, not_before, start)
+            if cut and not _past_second(last, start):  # one second holds more changes than a poll reads
+                found, last, cut = await self._run(self.calendar.candidates, self._patterns, not_before, start,
+                                                   DEEP_PAGES)
         except ApiError:
             self.journal.set_cursor("calendar", None)  # the pass starts again from the watermark
             raise
-        if cut and last is not None and last > start:
+        if cut:
+            if not _past_second(last, start):  # still that one second: its unread rest is skipped, nothing after
+                logger.warning("gemini-voice: more calendar changes within one second than %s pages hold", DEEP_PAGES)
+                last = start.replace(microsecond=0) + timedelta(seconds=1)
             self.journal.set_cursor("calendar", {"min": iso(last), "started": iso(started)})
             return found, mark
-        if cut:
-            logger.warning("gemini-voice: more calendar changes within one second than one poll reads")
         self.journal.set_cursor("calendar", None)
         return found, started
 
@@ -270,30 +300,37 @@ class VoiceBridge:
                           problems: List[GoogleError]) -> List[Verdict]:
         """The newest files on every poll, so a new task never waits behind a long listing; the rest of the
         window is walked newest first over the following polls, from the oldest file the last one read."""
-        outbound = self.journal.outbound_ids()
+        outbound, recent = self.journal.outbound_ids(), self._clock() - HEAD_WINDOW
         found, head_last, head_cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
-                                                     outbound, None, HEAD_PAGES)
-        before = from_iso((self.journal.cursor("drive") or {}).get("before")) or (head_last if head_cut else None)
-        if before is None:
-            return found
+                                                     outbound, None, MAX_PAGES, recent)
+        before = from_iso((self.journal.cursor("drive") or {}).get("before")) \
+            or (head_last if head_cut and head_last is not None else recent)
         try:
             more, last, cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
                                               outbound, before, MAX_PAGES)
+            if cut and not _before_second(last, before):  # one second holds more files than a poll reads
+                more, last, cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
+                                                  outbound, before, DEEP_PAGES)
         except (ApiError, TransientError) as exc:  # the newest files still count
             if isinstance(exc, ApiError):
                 self.journal.set_cursor("drive", None)
             problems.append(exc)
             return found
-        going_on = cut and last is not None and last < before  # else the walk is over (or cannot move on)
-        self.journal.set_cursor("drive", {"before": iso(last)} if going_on else None)
+        if cut and not _before_second(last, before):  # still that one second: its unread rest is skipped
+            logger.warning("gemini-voice: more files created within one second than %s pages hold", DEEP_PAGES)
+            last = before.replace(microsecond=0) - timedelta(microseconds=1)
+        self.journal.set_cursor("drive", {"before": iso(last)} if cut and last is not None else None)
         return found + more
 
     def _consider(self, verdict: Verdict, now: datetime) -> None:
         obj = verdict.obj
-        if self.journal.get(obj.key) is not None:
+        record = self.journal.get(obj.key)
+        if record is not None:
+            if obj.fingerprint and verdict.accepted and record.get("state") == "queued"                     and now - obj.created <= SEEN_GRACE:  # still settling right after creation
+                self.journal.update(obj.key, seen_fingerprint=obj.fingerprint)
             return
         if verdict.accepted:
-            self.journal.queue(obj.key, obj.kind, obj.id, obj.title, obj.created, now)
+            self.journal.queue(obj.key, obj.kind, obj.id, obj.title, obj.created, now, obj.fingerprint)
             logger.info("gemini-voice: queued %s", obj.key)
             return
         if verdict.reason in FOREIGN_REASONS and textutil.has_label(obj.title, self._patterns):
@@ -410,7 +447,6 @@ class VoiceBridge:
 
     async def _claim(self, key: str, record: Dict[str, Any], now: datetime) -> Optional[str]:
         """Re-check ownership, read the task, write the acknowledgement; None when it must not start."""
-        intent: Dict[str, Any] = {}  # what an event will look like after our acknowledgement, before we write it
         try:
             problem = await self._run(self._recheck, record)
             if problem:
@@ -423,23 +459,24 @@ class VoiceBridge:
                 self.journal.mark(key, "skipped", now, reason="plugin_output")
                 return None
             ack = textutil.block(self._text["ack"].format(time=self._local(now)))
-            _, locator = await self._run(self._write, record, ack, intent)
+            if record["kind"] == "cal":
+                _, locator = await self._acknowledge_event(key, record, ack)
+            else:
+                _, locator = await self._run(self._write, record, ack)
         except ApiError as exc:
             logger.warning("gemini-voice: cannot start %s: %s", key, exc.code)
             self.journal.mark(key, "failed", now, reason=exc.code)
             return None
         except (AuthError, TransientError) as exc:
-            await self._unclaim(key, record, intent, exc, now)
+            await self._unclaim(key, record, exc, now)
             raise
         self.journal.mark(key, "claimed", now, locator=locator, retry_at=None, retry_code=None)
         return self._prompt(record, text)
 
-    async def _unclaim(self, key: str, record: Dict[str, Any], intent: Dict[str, Any], exc: GoogleError,
-                       now: datetime) -> None:
+    async def _unclaim(self, key: str, record: Dict[str, Any], exc: GoogleError, now: datetime) -> None:
         """Google did not answer while the task was being claimed: it goes back to the queue and is retried
         after a growing pause (other tasks may start meanwhile), or fails with a note after the last attempt.
         A broken token is not the task's fault and does not count as an attempt."""
-        self._remember_intent(key, record, intent)
         attempts = int(record.get("attempts") or 0)
         if isinstance(exc, AuthError):
             self.journal.mark(key, "queued", now, attempts=max(0, attempts - 1))
@@ -450,17 +487,28 @@ class VoiceBridge:
             pause = min(CLAIM_RETRY_MAX, timedelta(seconds=self.settings.poll_seconds * 2 ** attempts))
             self.journal.mark(key, "queued", now, retry_at=iso(now + pause), retry_code=exc.code)
 
-    def _remember_intent(self, key: str, record: Dict[str, Any], intent: Dict[str, Any]) -> None:
-        """An acknowledgement whose response was lost may still have landed. Every such write stays
-        recognisable (its suffix for the next write, its fingerprint for the ownership re-check), and so does
-        the stamp of the last write known to have landed: any of them may be what the event holds now."""
-        if not intent.get("fingerprint"):
-            return
+    async def _acknowledge_event(self, key: str, record: Dict[str, Any], ack: str) -> Tuple[int, Locator]:
+        """The event acknowledgement, written ahead: what the event will look like is in the journal before
+        the write, so a lost response or a restart right after it never makes our own edit look foreign."""
+        for _ in range(3):
+            plan = await self._run(self.calendar.plan, record["id"], ack, record.get("locator"))
+            self._remember_intent(key, record, plan)
+            try:
+                return await self._run(self.calendar.apply, record["id"], plan)
+            except ApiError as exc:
+                if exc.status != 412:
+                    raise
+        raise ApiError("conflict", "event kept changing while writing", 412)
+
+    def _remember_intent(self, key: str, record: Dict[str, Any], plan: Dict[str, Any]) -> None:
+        """Every acknowledgement about to be written stays recognisable (its suffix for the next write, its
+        fingerprint for the ownership re-check), and so does the stamp of the last write known to have landed:
+        any of them may be what the event holds now."""
         previous = record.get("locator") or {}
-        locator = {"suffix": intent["suffix"], "suffixes": own_suffixes(previous)[:KEEP_INTENTS]}
+        locator = {"suffix": plan["suffix"], "suffixes": own_suffixes(previous)[:KEEP_INTENTS]}
         if previous.get("updated"):
             locator["updated"] = previous["updated"]
-        prints = [intent["fingerprint"], *(record.get("ack_fingerprints") or [])][:KEEP_INTENTS]
+        prints = [plan["fingerprint"], *(record.get("ack_fingerprints") or [])][:KEEP_INTENTS]
         self.journal.update(key, locator=locator, ack_fingerprints=prints)
 
     def _prompt(self, record: Dict[str, Any], text: str) -> str:
@@ -477,7 +525,7 @@ class VoiceBridge:
             # exactly one our recorded write produced, or while the event is exactly what one of our writes was
             # to make it (its response lost); never on the mere intention to write.
             return self.calendar.recheck(record["id"], [(record.get("locator") or {}).get("updated")],
-                                         record.get("ack_fingerprints") or [])
+                                         record.get("ack_fingerprints") or [], record.get("seen_fingerprint") or "")
         return self.drive.recheck(record["id"])
 
     def _read(self, record: Dict[str, Any]) -> Tuple[str, bool]:
@@ -490,14 +538,10 @@ class VoiceBridge:
             return f"{title}\n{body}".strip(), textutil.is_output(body)
         return self.sheets.read(obj_id, title, locator), False
 
-    def _write(self, record: Dict[str, Any], block_text: str,
-               intent: Optional[Dict[str, Any]] = None) -> Tuple[int, Locator]:
+    def _write(self, record: Dict[str, Any], block_text: str) -> Tuple[int, Locator]:
         kind, obj_id = record["kind"], record["id"]
-        if kind == "cal":
-            status, locator = self.calendar.write(obj_id, block_text, record.get("locator"), intent)
-        else:
-            writer = {"doc": self.docs.write, "sheet": self.sheets.write}[kind]
-            status, locator = writer(obj_id, block_text, record.get("locator"))
+        writer = {"cal": self.calendar.write, "doc": self.docs.write, "sheet": self.sheets.write}[kind]
+        status, locator = writer(obj_id, block_text, record.get("locator"))
         logger.info("gemini-voice: wrote to %s.%s HTTP %s", kind, obj_id, status)
         return status, locator
 
@@ -505,7 +549,7 @@ class VoiceBridge:
         """Close a task with a note in its object. A note Google cannot take now is written on a later poll;
         a reply that arrives while the note is being written takes the object instead of the closing."""
         record = self.journal.get(key) or {}
-        before, locator, pending = record.get("state"), record.get("locator"), None
+        before, locator, pending = _version(record), record.get("locator"), None
         try:
             _, locator = await self._run(self._write, record, textutil.block(note))
         except ApiError as exc:
@@ -513,8 +557,9 @@ class VoiceBridge:
         except (AuthError, TransientError) as exc:
             logger.warning("gemini-voice: the %s note to %s waits for Google (%s)", state, key, exc.code)
             pending = note
-        if (self.journal.get(key) or {}).get("state") != before:
-            self.journal.update(key, locator=locator)  # the reply replaces the note
+            self._note_errors.append(exc)
+        if _version(self.journal.get(key) or {}) != before:
+            self.journal.update(key, locator=locator)  # a (newer) reply arrived meanwhile: it replaces the note
             return
         self.journal.mark(key, state, now, locator=locator, note_pending=pending, note_at=iso(now) if pending else None)
 
@@ -531,6 +576,8 @@ class VoiceBridge:
             status, locator = await self._run(self._write, record, textutil.block(header, body))
         except ApiError as exc:
             logger.warning("gemini-voice: reply to %s refused by Google: %s", key, exc.code)
+            if (self.journal.get(key) or {}).get("reply_sha") != digest:
+                return True  # a newer reply arrived meanwhile: it is written (or refused) on its own
             await self._close_with_note(key, "failed", self._text["failed"].format(reason=exc.code), now)
             return False
         except (AuthError, TransientError) as exc:

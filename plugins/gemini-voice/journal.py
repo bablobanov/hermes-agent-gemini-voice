@@ -113,9 +113,12 @@ class Journal:
     def get(self, key: Optional[str]) -> Optional[Dict[str, Any]]:
         return self.objects.get(key) if key else None
 
-    def queue(self, key: str, kind: str, obj_id: str, title: str, created: datetime, now: datetime) -> None:
+    def queue(self, key: str, kind: str, obj_id: str, title: str, created: datetime, now: datetime,
+              seen_fingerprint: str = "") -> None:
         self.objects[key] = {"kind": kind, "id": obj_id, "title": title[:200], "created": iso(created),
                              "state": "queued", "queued_at": iso(now), "attempts": 0}
+        if seen_fingerprint:
+            self.objects[key]["seen_fingerprint"] = seen_fingerprint
         self.save()
 
     def mark(self, key: str, state: str, now: datetime, **fields: Any) -> Dict[str, Any]:

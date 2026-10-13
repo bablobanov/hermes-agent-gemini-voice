@@ -32,6 +32,7 @@ DOC_MIME = "application/vnd.google-apps.document"
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 OUTPUT_PROPERTY = "gemini_voice"
 MAX_PAGES = 5
+DEEP_PAGES = 40  # one poll reads this far when a single second holds more changes than MAX_PAGES
 EDIT_WINDOW = timedelta(minutes=10)
 SHEET_READ_ROWS = 500
 SHEET_READ_RANGE = f"A1:Z{SHEET_READ_ROWS}"
@@ -56,6 +57,7 @@ class VoiceObject:
     id: str
     title: str
     created: datetime
+    fingerprint: str = ""  # events: what the task is read from, as first seen (see Calendar.recheck)
 
     @property
     def key(self) -> str:
@@ -145,7 +147,7 @@ def event_problem(event: dict) -> str:
 def check_event(event: dict, patterns: Sequence[re.Pattern], not_before: datetime) -> Verdict:
     """Accept only an owner-only one-off event, created after ``not_before``, with a label in its title."""
     obj = VoiceObject("cal", str(event.get("id") or ""), str(event.get("summary") or ""),
-                      parse_time(event.get("created")) or _EPOCH)
+                      parse_time(event.get("created")) or _EPOCH, event_fingerprint(event))
     reason = event_problem(event) or _first_failure((
         (obj.created < not_before, "too_old"),
         (not textutil.has_label(obj.title, patterns), "no_label"),
@@ -160,14 +162,14 @@ class Calendar:
     def __init__(self, client: GoogleClient):
         self.client = client
 
-    def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime,
-                   updated_min: datetime) -> Tuple[List[Verdict], Optional[datetime], bool]:
-        """Verdicts on events changed since ``updated_min`` (in update order), the latest change read, and
-        whether ``MAX_PAGES`` cut the listing (the next poll goes on from that change)."""
+    def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime, updated_min: datetime,
+                   pages: int = MAX_PAGES) -> Tuple[List[Verdict], Optional[datetime], bool]:
+        """Verdicts on events changed since ``updated_min`` (whole seconds; in update order), the latest
+        change read, and whether ``pages`` cut the listing (the next read goes on from that change)."""
         # singleEvents=false: a recurring series is one item (and rejected), never hundreds of instances.
         params = {"updatedMin": rfc3339(updated_min), "singleEvents": "false", "showDeleted": "false",
                   "maxResults": 250, "orderBy": "updated"}
-        items, cut = _paged(self.client, CAL_EVENTS, params, "items")
+        items, cut = _paged(self.client, CAL_EVENTS, params, "items", pages)
         stamps = [t for t in (parse_time(e.get("updated")) for e in items) if t is not None]
         return [check_event(e, patterns, not_before) for e in items], (max(stamps) if stamps else None), cut
 
@@ -175,18 +177,24 @@ class Calendar:
         return self.client.request("GET", f"{CAL_EVENTS}/{_quote(event_id)}").body
 
     def recheck(self, event_id: str, own_updates: Sequence[Optional[str]] = (),
-                own_fingerprints: Sequence[str] = ()) -> str:
-        """Ownership again, right before the task starts. A later edit is forgiven only while it is provably
-        our own acknowledgement: the event's ``updated`` is a stamp one of our writes produced, or (a write's
-        response lost) everything the task is read from is exactly what one of our writes was to make it."""
+                own_fingerprints: Sequence[str] = (), seen: str = "") -> str:
+        """Ownership again, right before the task starts. The text the task is read from must still be what
+        the plugin first saw (``seen``) or what one of its own writes made it: Google does not say who edited
+        an event, so a change by anyone else after that moment means the task is not run. A later edit is
+        forgiven only while it is provably our own acknowledgement: the event's ``updated`` is a stamp one of
+        our writes produced, or (a write's response lost) the event is exactly what one of our writes was to
+        make it."""
         event = self._get(event_id)
         problem = event_problem(event)
-        if problem != "edited_after_creation":
+        if problem not in ("", "edited_after_creation"):
             return problem
-        updated = parse_time(event.get("updated"))
-        if updated is not None and any(parse_time(stamp) == updated for stamp in own_updates if stamp):
+        updated, fingerprint = parse_time(event.get("updated")), event_fingerprint(event)
+        stamped = updated is not None and any(parse_time(stamp) == updated for stamp in own_updates if stamp)
+        if stamped or fingerprint in set(own_fingerprints):
             return ""
-        return "" if event_fingerprint(event) in set(own_fingerprints) else problem
+        if problem or (seen and fingerprint != seen):
+            return "edited_after_creation"
+        return ""
 
     def read(self, event_id: str, previous: Optional[Locator] = None) -> str:
         event = self._get(event_id)
@@ -199,26 +207,31 @@ class Calendar:
                  html_to_text(description).strip()]
         return "\n".join(p for p in parts if p)
 
-    def write(self, event_id: str, block_text: str, previous: Optional[Locator],
-              intent: Optional[Dict[str, Any]] = None) -> Tuple[int, Locator]:
-        """Replace our previous block if it is still the exact end of the description, else append. The
-        locator keeps the ``updated`` stamp of this write: the proof that the last change is ours. ``intent``
-        receives, before the write, the suffix and the fingerprint of the event as the write will leave it."""
+    def write(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
+        """Replace our previous block if it is still the exact end of the description, else append."""
         for _ in range(3):
-            event = self._get(event_id)
-            description, suffix = merge_description(event.get("description") or "", block_text,
-                                                    own_suffixes(previous))
-            if intent is not None:
-                intent.update(suffix=suffix, fingerprint=event_fingerprint(dict(event, description=description)))
             try:
-                resp = self.client.request(
-                    "PATCH", f"{CAL_EVENTS}/{_quote(event_id)}", params={"sendUpdates": "none"},
-                    body={"description": description}, headers={"If-Match": str(event.get("etag") or "*")})
-                return resp.status, {"suffix": suffix, "updated": str((resp.body or {}).get("updated") or "")}
+                return self.apply(event_id, self.plan(event_id, block_text, previous))
             except ApiError as exc:
                 if exc.status != 412:
                     raise
         raise ApiError("conflict", "event kept changing while writing", 412)
+
+    def plan(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Dict[str, Any]:
+        """What a write will send, and the suffix and fingerprint of the event as it will leave it: kept by
+        the caller before the write, so a write whose response (or process) is lost stays recognisable."""
+        event = self._get(event_id)
+        description, suffix = merge_description(event.get("description") or "", block_text, own_suffixes(previous))
+        return {"etag": str(event.get("etag") or "*"), "description": description, "suffix": suffix,
+                "fingerprint": event_fingerprint(dict(event, description=description))}
+
+    def apply(self, event_id: str, plan: Dict[str, Any]) -> Tuple[int, Locator]:
+        """Send a planned write, only onto the version it was planned on (HTTP 412 otherwise). The locator
+        keeps the ``updated`` stamp of this write: the proof that the last change is ours."""
+        resp = self.client.request(
+            "PATCH", f"{CAL_EVENTS}/{_quote(event_id)}", params={"sendUpdates": "none"},
+            body={"description": plan["description"]}, headers={"If-Match": plan["etag"]})
+        return resp.status, {"suffix": plan["suffix"], "updated": str((resp.body or {}).get("updated") or "")}
 
 
 def event_fingerprint(event: dict) -> str:
@@ -285,15 +298,16 @@ class Drive:
         self.client = client
 
     def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime, kinds: Sequence[str],
-                   outbound: Sequence[str], before: Optional[datetime] = None,
-                   pages: int = MAX_PAGES) -> Tuple[List[Verdict], Optional[datetime], bool]:
-        """Verdicts on files created after ``not_before`` (and no later than ``before``), newest first, the
-        creation time of the oldest file read, and whether more remain (the next read goes on from it)."""
+                   outbound: Sequence[str], before: Optional[datetime] = None, pages: int = MAX_PAGES,
+                   after: Optional[datetime] = None) -> Tuple[List[Verdict], Optional[datetime], bool]:
+        """Verdicts on files created after ``not_before`` (and after ``after``, and before the second after
+        ``before``), newest first, the creation time of the oldest file read, and whether more remain (the
+        next read goes on from it)."""
         mimes = [m for m, k in ((DOC_MIME, "doc"), (SHEET_MIME, "sheet")) if k in kinds]
         if not mimes:
             return [], None, False
         mime_q = " or ".join(f"mimeType='{m}'" for m in mimes)
-        bounds = f"createdTime > '{_drive_time(not_before)}'"
+        bounds = f"createdTime > '{_drive_time(max(not_before, after or not_before))}'"
         if before is not None:  # whole seconds in the query: one second later, so no file of that second is skipped
             bounds += f" and createdTime < '{_drive_time(before + timedelta(seconds=1))}'"
         # Files shared with the owner are listed too, so that a labelled foreign file is rejected (and

@@ -249,7 +249,11 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
         oid = owe(key, "A: four")
         await bridge._lock.acquire()  # a poll is in the middle of its Google calls
         send = asyncio.create_task(adapter.send("owner", "A: four", reply_to=key, metadata={"notify": True}))
-        await asyncio.sleep(0.05)
+        for _ in range(200):  # until the reply is in the plugin's journal and the send waits for the poll
+            await asyncio.sleep(0.01)
+            if (bridge.journal.get(key) or {}).get("state") == "answered":
+                break
+        journaled = (bridge.journal.get(key) or {}).get("state") == "answered" and not send.done()
         send.cancel()  # a graceful shutdown cancels the turn's send
         await asyncio.gather(send, return_exceptions=True)
         bridge._lock.release()
@@ -261,9 +265,10 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
         stray_oid = owe(key, "B: a reply nobody holds")
         die(stray_oid)
         stray = await boot_resend(adapter, stray_oid)
-        return held, row_state(oid), stray, row_state(stray_oid), fake.doc_text(doc)
-    held, held_row, stray, stray_row, text = asyncio.run(scenario())
+        return journaled, held, row_state(oid), stray, row_state(stray_oid), fake.doc_text(doc)
+    journaled, held, held_row, stray, stray_row, text = asyncio.run(scenario())
     return {
+        "ledger: a reply waiting behind a poll is journaled before it waits": [journaled, repr(journaled)],
         "ledger: a reply cut off behind a poll is held, its row closed, written once": [
             held.success and held_row == "delivered" and text.count("A: four") == 1, f"{held_row}: {text!r}"],
         "ledger: a re-send nobody holds is refused for good, nothing written": [
