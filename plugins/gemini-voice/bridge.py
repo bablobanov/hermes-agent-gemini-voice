@@ -11,6 +11,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -18,7 +19,7 @@ from . import textutil
 from .google_api import ApiError, AuthError, GoogleClient, GoogleError, TransientError
 from .journal import Journal, Store, from_iso, iso
 from .sources import (DEEP_PAGES, MAX_PAGES, Calendar, CalendarOutput, Docs, Drive, Locator, Sheets, Verdict,
-                      own_suffixes)
+                      event_text, judge_event, own_suffixes, plan_event_write)
 
 logger = logging.getLogger("gemini_voice")
 
@@ -38,17 +39,31 @@ MAX_LOGGED_REJECTS = 1000
 # poll), so an outage of one API up to about 45 minutes delays it instead of failing it.
 CLAIM_ATTEMPTS = 6
 CLAIM_RETRY_MAX = timedelta(minutes=15)
-KEEP_INTENTS = 4
+KEEP_INTENTS = 32  # every acknowledgement that may have landed: at most 6 attempts of 3 tries, plus outages
+CLAIM_TRIES = 3  # an object changing under the claim is read again this often, then retried later
+_CHANGED = object()
 NOTE_RETRY_WINDOW = timedelta(hours=24)
 # The gateway's delivery ledger re-sends a reply for at most a day (STALE_AFTER_SECONDS).
 REPLAY_WINDOW = timedelta(hours=24)
 # Drive: files created this recently are read on every poll (new tasks); older ones by the walk over the window.
 HEAD_WINDOW = timedelta(minutes=15)
-# An event's text may still settle this soon after creation (the Gemini app); later, any change by someone
-# other than the plugin means the task is not run (Google does not say who edited an event).
-SEEN_GRACE = timedelta(minutes=2)
 TEXT_ONLY = "files, images and audio are not delivered on the voice channel; put the content into the text"
 _SLOT = re.compile(r"^event-([01]\d|2[0-3])([0-5]\d)$")
+
+
+@dataclass(frozen=True)
+class _ClaimView:
+    problem: str
+    text: str = ""
+    is_output: bool = False
+    write: Optional[Callable[[], Tuple[int, Locator]]] = None
+    conflict: Optional[int] = None  # the HTTP status meaning "changed since read"
+
+
+def _newest_unique(items: List[str]) -> List[str]:
+    seen: set = set()
+    kept = [x for x in items if x and not (x in seen or seen.add(x))]
+    return kept[:KEEP_INTENTS]
 
 
 def _version(record: Dict[str, Any]) -> Tuple[Any, Any]:
@@ -261,7 +276,7 @@ class VoiceBridge:
             listings += 1
             walk: List[GoogleError] = []  # the newest files answered, the walk over older ones did not
             try:
-                verdicts += await self._list_drive(not_before, kinds, walk)
+                verdicts += await self._list_drive(now, not_before, kinds, walk)
             except (ApiError, TransientError) as exc:
                 problems.append(exc)
             listings, problems = listings + len(walk), problems + walk
@@ -296,15 +311,22 @@ class VoiceBridge:
         self.journal.set_cursor("calendar", None)
         return found, started
 
-    async def _list_drive(self, not_before: datetime, kinds: List[str],
+    async def _list_drive(self, now: datetime, not_before: datetime, kinds: List[str],
                           problems: List[GoogleError]) -> List[Verdict]:
-        """The newest files on every poll, so a new task never waits behind a long listing; the rest of the
-        window is walked newest first over the following polls, from the oldest file the last one read."""
-        outbound, recent = self.journal.outbound_ids(), self._clock() - HEAD_WINDOW
+        """The newest files on every poll (all created since shortly before the last such read), so a new task
+        never waits behind a long listing; the rest of the window is walked newest first over the following
+        polls, from the oldest file the last one read."""
+        outbound, recent = self.journal.outbound_ids(), now - HEAD_WINDOW
+        last_head = from_iso((self.journal.cursor("drive_head") or {}).get("at"))
+        if last_head is not None:  # after a pause, everything since the last read counts as new
+            recent = min(recent, last_head - HEAD_WINDOW)
         found, head_last, head_cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
                                                      outbound, None, MAX_PAGES, recent)
-        before = from_iso((self.journal.cursor("drive") or {}).get("before")) \
-            or (head_last if head_cut and head_last is not None else recent)
+        self.journal.set_cursor("drive_head", {"at": iso(now)})
+        if head_cut and head_last is not None:  # more new files than the head holds: the walk takes over below it
+            before = head_last
+        else:
+            before = from_iso((self.journal.cursor("drive") or {}).get("before")) or recent
         try:
             more, last, cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
                                               outbound, before, MAX_PAGES)
@@ -324,10 +346,7 @@ class VoiceBridge:
 
     def _consider(self, verdict: Verdict, now: datetime) -> None:
         obj = verdict.obj
-        record = self.journal.get(obj.key)
-        if record is not None:
-            if obj.fingerprint and verdict.accepted and record.get("state") == "queued"                     and now - obj.created <= SEEN_GRACE:  # still settling right after creation
-                self.journal.update(obj.key, seen_fingerprint=obj.fingerprint)
+        if self.journal.get(obj.key) is not None:
             return
         if verdict.accepted:
             self.journal.queue(obj.key, obj.kind, obj.id, obj.title, obj.created, now, obj.fingerprint)
@@ -446,23 +465,16 @@ class VoiceBridge:
             self.journal.close_turn(key)
 
     async def _claim(self, key: str, record: Dict[str, Any], now: datetime) -> Optional[str]:
-        """Re-check ownership, read the task, write the acknowledgement; None when it must not start."""
+        """Re-check ownership, read the task and write the acknowledgement, for events and Docs on one and the
+        same version of the object (a change in between starts all three again); None when it must not start.
+        An object that keeps changing is retried later like an outage."""
+        ack = textutil.block(self._text["ack"].format(time=self._local(now)))
         try:
-            problem = await self._run(self._recheck, record)
-            if problem:
-                logger.info("gemini-voice: ignored %s (%s): changed before it started", key, problem)
-                self.journal.mark(key, "rejected", now, reason=problem)
-                return None
-            text, is_output = await self._run(self._read, record)
-            if is_output:
-                logger.info("gemini-voice: %s is an output of this plugin; not a task", key)
-                self.journal.mark(key, "skipped", now, reason="plugin_output")
-                return None
-            ack = textutil.block(self._text["ack"].format(time=self._local(now)))
-            if record["kind"] == "cal":
-                _, locator = await self._acknowledge_event(key, record, ack)
-            else:
-                _, locator = await self._run(self._write, record, ack)
+            for _ in range(CLAIM_TRIES):
+                outcome = await self._claim_once(key, record, ack, now)
+                if outcome is not _CHANGED:
+                    return outcome
+            raise TransientError("conflict", "the object kept changing while the task was being started")
         except ApiError as exc:
             logger.warning("gemini-voice: cannot start %s: %s", key, exc.code)
             self.journal.mark(key, "failed", now, reason=exc.code)
@@ -470,8 +482,58 @@ class VoiceBridge:
         except (AuthError, TransientError) as exc:
             await self._unclaim(key, record, exc, now)
             raise
+
+    async def _claim_once(self, key: str, record: Dict[str, Any], ack: str, now: datetime) -> Any:
+        view = await self._view(key, record, ack)
+        if view.problem:
+            await self._reject(key, record, view.problem, now)
+            return None
+        if view.is_output:
+            logger.info("gemini-voice: %s is an output of this plugin; not a task", key)
+            self.journal.mark(key, "skipped", now, reason="plugin_output")
+            return None
+        try:
+            status, locator = await self._run(view.write)
+        except ApiError as exc:
+            if view.conflict is None or exc.status != view.conflict:
+                raise
+            return _CHANGED  # the object changed after it was read: check and read it again
+        logger.info("gemini-voice: wrote to %s HTTP %s", key, status)
         self.journal.mark(key, "claimed", now, locator=locator, retry_at=None, retry_code=None)
-        return self._prompt(record, text)
+        return self._prompt(record, view.text)
+
+    async def _view(self, key: str, record: Dict[str, Any], ack: str) -> "_ClaimView":
+        """One copy of the object: whether it may start, its task text, and the acknowledgement write that
+        lands only on that same copy (events: If-Match; Docs: the revision). Sheets have no such guard."""
+        kind, obj_id, locator, title = record["kind"], record["id"], record.get("locator"), record.get("title") or ""
+        if kind == "cal":
+            event = await self._run(self.calendar.get, obj_id)
+            problem = judge_event(event, [(locator or {}).get("updated")], record.get("ack_fingerprints") or [],
+                                  record.get("seen_fingerprint") or "")
+            if problem:
+                return _ClaimView(problem)
+            plan = plan_event_write(event, ack, locator)
+            self._remember_intent(key, record, plan)  # kept before the write: a lost response stays ours
+            return _ClaimView("", event_text(event, locator), False, partial(self.calendar.apply, obj_id, plan), 412)
+        problem = await self._run(self.drive.recheck, obj_id)
+        if problem:
+            return _ClaimView(problem)
+        if kind == "doc":
+            doc = await self._run(self.docs.get, obj_id)
+            body = Docs.body_text(doc, locator)
+            return _ClaimView("", f"{title}\n{body}".strip(), textutil.is_output(body),
+                              partial(self.docs.write_on, obj_id, doc, ack, locator), 400)
+        text = await self._run(self.sheets.read, obj_id, title, locator)
+        return _ClaimView("", text, False, partial(self.sheets.write, obj_id, ack, locator), None)
+
+    async def _reject(self, key: str, record: Dict[str, Any], problem: str, now: datetime) -> None:
+        logger.info("gemini-voice: ignored %s (%s): changed before it started", key, problem)
+        if record["kind"] == "cal" and problem == "edited_after_creation":
+            # still the owner's own event (creator and organizer): say why nothing happens
+            await self._close_with_note(key, "rejected", self._text["changed"], now)
+            self.journal.update(key, reason=problem)
+        else:  # someone else's now (shared, guests, ...): nothing is written into it
+            self.journal.mark(key, "rejected", now, reason=problem)
 
     async def _unclaim(self, key: str, record: Dict[str, Any], exc: GoogleError, now: datetime) -> None:
         """Google did not answer while the task was being claimed: it goes back to the queue and is retried
@@ -487,28 +549,16 @@ class VoiceBridge:
             pause = min(CLAIM_RETRY_MAX, timedelta(seconds=self.settings.poll_seconds * 2 ** attempts))
             self.journal.mark(key, "queued", now, retry_at=iso(now + pause), retry_code=exc.code)
 
-    async def _acknowledge_event(self, key: str, record: Dict[str, Any], ack: str) -> Tuple[int, Locator]:
-        """The event acknowledgement, written ahead: what the event will look like is in the journal before
-        the write, so a lost response or a restart right after it never makes our own edit look foreign."""
-        for _ in range(3):
-            plan = await self._run(self.calendar.plan, record["id"], ack, record.get("locator"))
-            self._remember_intent(key, record, plan)
-            try:
-                return await self._run(self.calendar.apply, record["id"], plan)
-            except ApiError as exc:
-                if exc.status != 412:
-                    raise
-        raise ApiError("conflict", "event kept changing while writing", 412)
-
     def _remember_intent(self, key: str, record: Dict[str, Any], plan: Dict[str, Any]) -> None:
         """Every acknowledgement about to be written stays recognisable (its suffix for the next write, its
         fingerprint for the ownership re-check), and so does the stamp of the last write known to have landed:
-        any of them may be what the event holds now."""
+        any of them may be what the event holds now. Bounded, newest first, without repeats."""
         previous = record.get("locator") or {}
-        locator = {"suffix": plan["suffix"], "suffixes": own_suffixes(previous)[:KEEP_INTENTS]}
+        suffixes = _newest_unique([plan["suffix"], *own_suffixes(previous)])
+        locator = {"suffix": suffixes[0], "suffixes": suffixes[1:]}
         if previous.get("updated"):
             locator["updated"] = previous["updated"]
-        prints = [plan["fingerprint"], *(record.get("ack_fingerprints") or [])][:KEEP_INTENTS]
+        prints = _newest_unique([plan["fingerprint"], *(record.get("ack_fingerprints") or [])])
         self.journal.update(key, locator=locator, ack_fingerprints=prints)
 
     def _prompt(self, record: Dict[str, Any], text: str) -> str:
@@ -519,25 +569,6 @@ class VoiceBridge:
         return f"[Voice task from the owner via the Gemini app · {kind}{when}]\n{body}"
 
     # ------------------------------------------------------------------------------- Google I/O
-    def _recheck(self, record: Dict[str, Any]) -> str:
-        if record["kind"] == "cal":
-            # Our own acknowledgement moves ``updated``: it is forgiven only while the event's last change is
-            # exactly one our recorded write produced, or while the event is exactly what one of our writes was
-            # to make it (its response lost); never on the mere intention to write.
-            return self.calendar.recheck(record["id"], [(record.get("locator") or {}).get("updated")],
-                                         record.get("ack_fingerprints") or [], record.get("seen_fingerprint") or "")
-        return self.drive.recheck(record["id"])
-
-    def _read(self, record: Dict[str, Any]) -> Tuple[str, bool]:
-        """``(task text, whether the object is an output of this plugin)``."""
-        kind, obj_id, title, locator = record["kind"], record["id"], record.get("title") or "", record.get("locator")
-        if kind == "cal":
-            return self.calendar.read(obj_id, locator), False
-        if kind == "doc":
-            body = self.docs.read_body(obj_id, locator)
-            return f"{title}\n{body}".strip(), textutil.is_output(body)
-        return self.sheets.read(obj_id, title, locator), False
-
     def _write(self, record: Dict[str, Any], block_text: str) -> Tuple[int, Locator]:
         kind, obj_id = record["kind"], record["id"]
         writer = {"cal": self.calendar.write, "doc": self.docs.write, "sheet": self.sheets.write}[kind]

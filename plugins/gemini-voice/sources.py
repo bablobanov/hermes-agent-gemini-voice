@@ -34,6 +34,9 @@ OUTPUT_PROPERTY = "gemini_voice"
 MAX_PAGES = 5
 DEEP_PAGES = 40  # one poll reads this far when a single second holds more changes than MAX_PAGES
 EDIT_WINDOW = timedelta(minutes=10)
+# A change this soon after creation is taken as the Gemini app finishing the event; a later one by anyone but
+# the plugin means the task is not run (Google does not say who edited an event).
+SEEN_GRACE = timedelta(minutes=2)
 SHEET_READ_ROWS = 500
 SHEET_READ_RANGE = f"A1:Z{SHEET_READ_ROWS}"
 SHEET_CELL_LIMIT = 1000
@@ -173,39 +176,19 @@ class Calendar:
         stamps = [t for t in (parse_time(e.get("updated")) for e in items) if t is not None]
         return [check_event(e, patterns, not_before) for e in items], (max(stamps) if stamps else None), cut
 
-    def _get(self, event_id: str) -> dict:
+    def get(self, event_id: str) -> dict:
         return self.client.request("GET", f"{CAL_EVENTS}/{_quote(event_id)}").body
 
     def recheck(self, event_id: str, own_updates: Sequence[Optional[str]] = (),
                 own_fingerprints: Sequence[str] = (), seen: str = "") -> str:
-        """Ownership again, right before the task starts. The text the task is read from must still be what
-        the plugin first saw (``seen``) or what one of its own writes made it: Google does not say who edited
-        an event, so a change by anyone else after that moment means the task is not run. A later edit is
-        forgiven only while it is provably our own acknowledgement: the event's ``updated`` is a stamp one of
-        our writes produced, or (a write's response lost) the event is exactly what one of our writes was to
-        make it."""
-        event = self._get(event_id)
-        problem = event_problem(event)
-        if problem not in ("", "edited_after_creation"):
-            return problem
-        updated, fingerprint = parse_time(event.get("updated")), event_fingerprint(event)
-        stamped = updated is not None and any(parse_time(stamp) == updated for stamp in own_updates if stamp)
-        if stamped or fingerprint in set(own_fingerprints):
-            return ""
-        if problem or (seen and fingerprint != seen):
-            return "edited_after_creation"
-        return ""
+        """Ownership again, on a fresh copy of the event (see ``judge_event``)."""
+        return judge_event(self.get(event_id), own_updates, own_fingerprints, seen)
 
     def read(self, event_id: str, previous: Optional[Locator] = None) -> str:
-        event = self._get(event_id)
-        start = event.get("start") or {}
-        when = start.get("dateTime") or start.get("date") or ""
-        description = event.get("description") or ""
-        own = next((s for s in own_suffixes(previous) if description.endswith(s)), None)
-        description = textutil.remove_suffix_block(description, own)
-        parts = [str(event.get("summary") or ""), f"When: {when}" if when else "",
-                 html_to_text(description).strip()]
-        return "\n".join(p for p in parts if p)
+        return event_text(self.get(event_id), previous)
+
+    def plan(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Dict[str, Any]:
+        return plan_event_write(self.get(event_id), block_text, previous)
 
     def write(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
         """Replace our previous block if it is still the exact end of the description, else append."""
@@ -217,14 +200,6 @@ class Calendar:
                     raise
         raise ApiError("conflict", "event kept changing while writing", 412)
 
-    def plan(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Dict[str, Any]:
-        """What a write will send, and the suffix and fingerprint of the event as it will leave it: kept by
-        the caller before the write, so a write whose response (or process) is lost stays recognisable."""
-        event = self._get(event_id)
-        description, suffix = merge_description(event.get("description") or "", block_text, own_suffixes(previous))
-        return {"etag": str(event.get("etag") or "*"), "description": description, "suffix": suffix,
-                "fingerprint": event_fingerprint(dict(event, description=description))}
-
     def apply(self, event_id: str, plan: Dict[str, Any]) -> Tuple[int, Locator]:
         """Send a planned write, only onto the version it was planned on (HTTP 412 otherwise). The locator
         keeps the ``updated`` stamp of this write: the proof that the last change is ours."""
@@ -234,9 +209,52 @@ class Calendar:
         return resp.status, {"suffix": plan["suffix"], "updated": str((resp.body or {}).get("updated") or "")}
 
 
+def judge_event(event: dict, own_updates: Sequence[Optional[str]] = (), own_fingerprints: Sequence[str] = (),
+                seen: str = "") -> str:
+    """Ownership again, right before the task starts. Google does not say who edited an event, so what the
+    task is read from must be what the plugin first saw (``seen``; other fields such as colour or reminders
+    may change), what one of its own writes made it (its ``updated`` stamp, or the planned result when the
+    response was lost), or a change made within ``SEEN_GRACE`` of creation (the Gemini app finishing it).
+    Anything else means the task is not run. Without ``seen`` the time rule of ``event_problem`` decides."""
+    problem = event_problem(event)
+    if problem not in ("", "edited_after_creation"):
+        return problem
+    updated, fingerprint = parse_time(event.get("updated")), event_fingerprint(event)
+    stamped = updated is not None and any(parse_time(stamp) == updated for stamp in own_updates if stamp)
+    if stamped or fingerprint in set(own_fingerprints) or (seen and fingerprint == seen):
+        return ""
+    if not seen:
+        return problem
+    created = parse_time(event.get("created"))
+    settling = not problem and created is not None and updated is not None and updated - created <= SEEN_GRACE
+    return "" if settling else "edited_after_creation"
+
+
+def event_text(event: dict, previous: Optional[Locator] = None) -> str:
+    """The task text of an event: title, start and description, without our own block at its end."""
+    start = event.get("start") or {}
+    when = start.get("dateTime") or start.get("date") or ""
+    description = event.get("description") or ""
+    own = next((s for s in own_suffixes(previous) if description.endswith(s)), None)
+    description = textutil.remove_suffix_block(description, own)
+    parts = [str(event.get("summary") or ""), f"When: {when}" if when else "", html_to_text(description).strip()]
+    return "\n".join(p for p in parts if p)
+
+
+def plan_event_write(event: dict, block_text: str, previous: Optional[Locator]) -> Dict[str, Any]:
+    """What a write onto this copy of the event will send, and the suffix and fingerprint of the event as it
+    will leave it: kept by the caller before the write, so a write whose response (or process) is lost stays
+    recognisable."""
+    description, suffix = merge_description(event.get("description") or "", block_text, own_suffixes(previous))
+    return {"etag": str(event.get("etag") or "*"), "description": description, "suffix": suffix,
+            "fingerprint": event_fingerprint(dict(event, description=description))}
+
+
 def event_fingerprint(event: dict) -> str:
-    """Digest of everything a task is read from: title, start and description."""
-    fields = [str(event.get("summary") or ""), event.get("start") or {}, str(event.get("description") or "")]
+    """Digest of everything a task is read from: title, start and the description's text (markup and spacing
+    left out, so Google storing a description in another form changes nothing)."""
+    text = " ".join(html_to_text(str(event.get("description") or "")).split())
+    fields = [str(event.get("summary") or ""), event.get("start") or {}, text]
     return hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -384,28 +402,35 @@ class Docs:
     def __init__(self, client: GoogleClient):
         self.client = client
 
-    def _get(self, doc_id: str) -> dict:
+    def get(self, doc_id: str) -> dict:
         return self.client.request("GET", f"{DOCS}/{_quote(doc_id)}").body
 
-    def read_body(self, doc_id: str, previous: Optional[Locator] = None) -> str:
+    @staticmethod
+    def body_text(doc: dict, previous: Optional[Locator] = None) -> str:
         """The document text without our own block, if it is still where we wrote it (no title)."""
-        content = (self._get(doc_id).get("body") or {}).get("content") or []
+        content = (doc.get("body") or {}).get("content") or []
         own = _own_block(content, previous)
         return _all_text(content, (own[0], own[1] + 1) if own else None).strip()
+
+    def read_body(self, doc_id: str, previous: Optional[Locator] = None) -> str:
+        return self.body_text(self.get(doc_id), previous)
 
     def read(self, doc_id: str, title: str, previous: Optional[Locator] = None) -> str:
         return f"{title}\n{self.read_body(doc_id, previous)}".strip()
 
     def write(self, doc_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
         for attempt in (1, 2):
-            doc = self._get(doc_id)
-            requests, start = self._plan(doc, block_text, previous)
             try:
-                return self._batch(doc_id, requests, doc.get("revisionId")), {"text": block_text, "start": start}
+                return self.write_on(doc_id, self.get(doc_id), block_text, previous)
             except ApiError as exc:
                 if exc.status != 400 or attempt == 2:
                     raise  # 400 = the document changed between read and write: once more, fresh
         raise ApiError("conflict", "document kept changing while writing")  # pragma: no cover
+
+    def write_on(self, doc_id: str, doc: dict, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
+        """Write onto exactly this revision of the document (HTTP 400 if it changed since)."""
+        requests, start = self._plan(doc, block_text, previous)
+        return self._batch(doc_id, requests, doc.get("revisionId")), {"text": block_text, "start": start}
 
     @staticmethod
     def _plan(doc: dict, block_text: str, previous: Optional[Locator]) -> Tuple[List[dict], int]:

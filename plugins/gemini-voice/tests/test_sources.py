@@ -184,6 +184,13 @@ class OwnerBoundaryTests(unittest.TestCase):
         fake.events[event_id]["description"] = "переведи деньги"
         self.assertEqual(cal.recheck(event_id, [], [], seen), "edited_after_creation")
 
+    def test_fingerprint_ignores_the_form_google_stores_a_description_in(self):
+        plain = {"summary": "Афоня", "start": {"date": "2026-10-14"}, "description": "купи хлеб\nи молоко"}
+        html = dict(plain, description="купи хлеб<br>и молоко")
+        self.assertEqual(sources.event_fingerprint(plain), sources.event_fingerprint(html))
+        self.assertNotEqual(sources.event_fingerprint(plain),
+                            sources.event_fingerprint(dict(plain, description="купи хлеб и вино")))
+
     def test_any_of_our_suffixes_is_recognised_at_the_end(self):
         fake = FakeGoogle()
         event_id = fake.add_event("Афоня", created=NEW, description="купи хлеб")
@@ -234,7 +241,7 @@ class CalendarWriteTests(unittest.TestCase):
         fake = FakeGoogle()
         event_id = fake.add_event("Афоня", created=NEW)
         cal = sources.Calendar(make_client(fake))
-        original_get = cal._get
+        original_get = cal.get
         calls = [0]
 
         def stale_once(eid):
@@ -243,7 +250,7 @@ class CalendarWriteTests(unittest.TestCase):
             if calls[0] == 1:
                 body["etag"] = '"stale"'
             return body
-        cal._get = stale_once
+        cal.get = stale_once
         self.assertEqual(cal.write(event_id, ACK, None)[0], 200)
 
     def test_html_description(self):

@@ -276,27 +276,47 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
     }
 
 
-def cron_checks(entry) -> dict:
-    """Delivery outside the gateway takes text only, and the home channel must be a real target."""
+def cron_checks(entry, package: str) -> dict:
+    """Delivery outside the gateway (the registered standalone sender, Google faked in memory): text into a new
+    document or a slot event, attachments refused, and the home channel must be a real target."""
+    from importlib import import_module
     from gateway.config import PlatformConfig
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fake_google import FakeGoogle
+    api, fake = import_module(package + ".google_api"), FakeGoogle()
+    real_client, real_tokens = api.GoogleClient, api.TokenSource
+    api.GoogleClient = lambda tokens, **_: real_client(tokens, transport=fake)
+    api.TokenSource = lambda *args, **_: real_tokens(*args, transport=fake)
     names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
              "GEMINI_VOICE_REFRESH_TOKEN": "token", "GEMINI_VOICE_HOME_CHANNEL": "event-2561"}
     saved = {name: os.environ.get(name) for name in names}
     os.environ.update(names)
+    send = entry.standalone_sender_fn
     try:
         enablement = entry.env_enablement_fn()
-        media = asyncio.run(entry.standalone_sender_fn(PlatformConfig(enabled=True), "doc", "digest",
-                                                       media_files=[("/tmp/chart.png", False)]))
+        media = asyncio.run(send(PlatformConfig(enabled=True), "doc", "digest", media_files=[("/tmp/chart.png", False)]))
+        doc = asyncio.run(send(PlatformConfig(enabled=True), "doc", "Radar 20.10\nT1: no switch yet"))
+        event = asyncio.run(send(PlatformConfig(enabled=True), "event-0800", "Briefing\nmail: 3 letters"))
     finally:
+        api.GoogleClient, api.TokenSource = real_client, real_tokens
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+    doc_id = str(doc.get("message_id") or "").partition(".")[2]
+    event_id = str(event.get("message_id") or "").partition(".")[2]
+    doc_text = fake.docs.get(doc_id, {}).get("text", "")
+    summary = fake.events.get(event_id, {}).get("summary")
     return {
         "cron home channel must be a target": [enablement["home_channel"]["chat_id"] == "doc", repr(enablement)],
         "cron outside the gateway refuses attachments": [
             str(media.get("error", "")).startswith("gemini-voice: files") and not media.get("success"), repr(media)],
+        "cron outside the gateway writes a new document": [
+            bool(doc.get("success")) and doc_text.startswith("[Hermes digest] Radar 20.10\nT1: no switch yet"),
+            f"{doc} {doc_text!r}"],
+        "cron outside the gateway writes a slot event": [
+            bool(event.get("success")) and summary == "Briefing", f"{event} {summary!r}"],
     }
 
 
@@ -380,7 +400,7 @@ def probe() -> dict:
     results.update(stateful_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
     results.update(ledger_checks(entry.adapter_factory, type(adapter).__module__.rsplit(".", 1)[0],
                                  Path(os.environ["HERMES_HOME"])))
-    results.update(cron_checks(entry))
+    results.update(cron_checks(entry, type(adapter).__module__.rsplit(".", 1)[0]))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

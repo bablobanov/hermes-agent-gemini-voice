@@ -24,6 +24,8 @@ STRINGS = {
         "done_silent": "done, no text reply ({time})",
         "daily_cap": "daily task limit reached ({limit}); this task was not run",
         "stale": "this task waited too long and was not run. Dictate it again if it is still needed",
+        "changed": "this task was not run: the event changed after it was first seen. Dictate it again if it is "
+                   "still needed",
         "truncated": "(reply shortened)",
     },
     "ru": {
@@ -34,6 +36,8 @@ STRINGS = {
         "done_silent": "готово, текстового ответа нет ({time})",
         "daily_cap": "дневной лимит поручений исчерпан ({limit}), это поручение не выполнялось",
         "stale": "поручение слишком долго ждало очереди и не выполнялось. Повторите, если ещё нужно",
+        "changed": "поручение не выполнялось: событие изменилось после того, как плагин его увидел. Повторите, "
+                   "если ещё нужно",
         "truncated": "(ответ сокращён)",
     },
 }

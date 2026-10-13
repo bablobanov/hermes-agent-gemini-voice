@@ -6,7 +6,8 @@
                  |-> failed (could not read or acknowledge it)
                  |-> queued (Google did not answer: retried later, with growing pauses)
     queued -> skipped (daily limit, waited too long, or it is the plugin's own output)
-    queued -> rejected (ownership no longer holds when the task is about to start; nothing is written)
+    queued -> rejected (ownership no longer holds when the task is about to start: nothing is written, but a
+               note in the owner's own event that changed after it was first seen)
 
 A closing note Google cannot take at once is kept (``note_pending``) and written on a later poll.
 

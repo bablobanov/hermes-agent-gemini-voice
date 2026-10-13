@@ -592,6 +592,127 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.state(f"doc.{doc}"), "abandoned")
         self.assertEqual(h.statuses[-1], ("retrying", "google_unreachable"))
 
+    async def test_an_event_the_app_finishes_seconds_after_it_was_listed_is_run(self):
+        h = Harness()
+        await h.bridge.tick()
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="")
+        h.later(seconds=20)
+        listed = h.bridge.calendar.candidates
+
+        def app_finishes_it_meanwhile(*args):
+            found = listed(*args)
+            h.fake.events[event].update(description="купи хлеб", updated=stamp(h.now[0]))
+            return found
+        h.bridge.calendar.candidates = app_finishes_it_meanwhile
+        await h.bridge.tick()  # listed, then started in the same poll
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+        self.assertIn("купи хлеб", h.dispatched[0].prompt)
+
+    async def test_the_owner_editing_a_waiting_event_gets_a_note_not_silence(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи молоко")
+        await h.bridge.tick()
+        h.fake.events[event].update(description="купи молоко и хлеб", updated=h.later(minutes=5))
+        h.busy[0] = False
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "rejected")
+        self.assertEqual(h.dispatched, [])
+        description = h.fake.events[event]["description"]
+        self.assertTrue(description.startswith("купи молоко и хлеб\n\n[Hermes] поручение не выполнялось"))
+
+    async def test_a_change_outside_the_task_text_does_not_stop_a_waiting_task(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.fake.events[event].update(colorId="5", updated=h.later(minutes=15))  # colour only, after the window
+        h.busy[0] = False
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+
+    async def test_an_edit_while_the_task_is_being_started_is_checked_again_not_run(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.later(minutes=15)
+        h.busy[0] = False
+        read = h.bridge.calendar.get
+        calls = [0]
+
+        def edited_right_after_our_read(event_id):
+            body = read(event_id)
+            calls[0] += 1
+            if calls[0] == 1:  # someone else rewrites it between our read and our acknowledgement
+                h.fake.events[event].update(description="переведи деньги", updated=stamp(h.now[0]), etag='"x"')
+            return body
+        h.bridge.calendar.get = edited_right_after_our_read
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "rejected")
+        self.assertEqual(h.dispatched, [])
+        self.assertNotIn("принял", h.fake.events[event]["description"])
+
+    async def test_a_doc_edited_while_the_task_is_being_started_is_read_again(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "купи хлеб", created=h.later(minutes=1))
+        read = h.bridge.docs.get
+        calls = [0]
+
+        def edited_right_after_our_read(doc_id):
+            body = read(doc_id)
+            calls[0] += 1
+            if calls[0] == 1:  # the owner adds a line between our read and our acknowledgement
+                h.fake.docs[doc]["text"] = "купи хлеб\nи молоко\n"
+                h.fake.docs[doc]["rev"] += 1
+            return body
+        h.bridge.docs.get = edited_right_after_our_read
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{doc}"])
+        self.assertIn("и молоко", h.dispatched[0].prompt)  # the version the acknowledgement landed on
+        self.assertEqual(h.fake.doc_text(doc).count("принял"), 1)
+
+    async def test_an_event_that_keeps_changing_is_retried_later_not_failed(self):
+        h = Harness()
+        await h.bridge.tick()
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        read = h.bridge.calendar.get
+        calls = [0]
+
+        def touched_after_each_read(event_id):
+            body = read(event_id)
+            calls[0] += 1
+            if calls[0] <= 3:  # e.g. a sync touches it: same text, a new version every time
+                h.fake.events[event]["etag"] = f'"touch{calls[0]}"'
+            return body
+        h.bridge.calendar.get = touched_after_each_read
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "queued")
+        h.later(minutes=3)
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+
+    async def test_a_landed_acknowledgement_stays_ours_through_many_failed_ones(self):
+        h = Harness()
+        await h.bridge.tick()
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        h.fake.lose_response_once = ("PATCH", CAL + "/")  # the first acknowledgement lands, its response is lost
+        await h.bridge.tick()
+        h.fake.fail_writes = True  # the next four never reach Google
+        for _ in range(4):
+            h.later(minutes=16)
+            await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "queued")
+        h.fake.fail_writes = False
+        h.later(minutes=16)
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
+        self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
+
     async def test_cancelled_turn_keeps_waiting_for_a_resume(self):
         h = Harness()
         await h.bridge.tick()
@@ -781,6 +902,33 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await h.bridge.tick()
         self.assertEqual([t.key for t in h.dispatched], [f"cal.{task}"])
+
+    async def test_after_a_pause_files_created_meanwhile_count_as_new(self):
+        h = Harness()
+        await h.bridge.tick()
+        for i in range(3000):  # a large window to walk
+            h.fake.add_doc(f"заметка {i}", "y", created=stamp(T0 + timedelta(seconds=i + 1)))
+        h.later(hours=2)
+        await h.bridge.tick()
+        task = h.fake.add_doc("Афоня перед паузой", "x", created=h.later(minutes=1))
+        h.later(minutes=40)  # the gateway was down for a while
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
+
+    async def test_more_new_files_than_the_head_holds_never_hide_one_behind_an_old_walk(self):
+        h = Harness()
+        h.fake.drive_page_size = 2  # the head reads ten files per poll
+        await h.bridge.tick()
+        for i in range(50):
+            h.fake.add_doc(f"заметка {i}", "y", created=stamp(T0 + timedelta(seconds=i + 1)))
+        h.later(hours=1)
+        await h.bridge.tick()  # a walk over the old files is under way
+        self.assertIsNotNone(h.bridge.journal.cursor("drive"))
+        task = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        for i in range(12):  # a burst right after the task: more than the head reads
+            h.fake.add_doc(f"копия {i}", "y", created=h.later(seconds=1))
+        await h.bridge.tick()
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
 
     async def test_a_broken_state_file_is_reported_and_the_poller_survives(self):
         h = Harness()
