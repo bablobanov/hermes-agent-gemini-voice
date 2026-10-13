@@ -24,7 +24,12 @@ PLATFORM_HINT = (
     "the task asks for more), in the language of the task. You cannot ask a clarifying question in the "
     "middle of a turn: make a reasonable assumption, or put the question in your final reply. Whenever "
     "your rules require the owner's confirmation, ask for it in the final reply; the owner answers by "
-    "dictating a new task, which arrives in this same chat."
+    "dictating a new task, which arrives in this same chat. Files, images and audio are not delivered "
+    "here: put everything into the text. This chat receives nothing later on its own, neither scheduled "
+    "jobs nor background-process notices: when the owner asks for something at a later time or on a "
+    "schedule (a reminder, a daily digest), create the cron job with deliver set to gemini_voice:doc (a new "
+    "Google Doc the owner can ask Gemini to read) or gemini_voice:event-HHMM (a calendar event at that local "
+    "time, e.g. gemini_voice:event-0800), and say in your reply where the result will appear."
 )
 
 CLARIFY_BLOCK = (

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -29,6 +30,10 @@ def _json(status: int, body: Any) -> Reply:
     return status, {"Content-Type": "application/json"}, json.dumps(body).encode("utf-8")
 
 
+def _when(value: Any) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
 def _error(status: int, reason: str = "", message: str = "error") -> Reply:
     return _json(status, {"error": {"code": status, "message": message, "errors": [{"reason": reason}] if reason else []}})
 
@@ -43,6 +48,9 @@ class FakeGoogle:
         self.revoked = False
         self.offline = False
         self.fail_writes = False
+        self.fail_cell_writes = False  # writing cell values fails (a values PUT, or a batchUpdate with updateCells)
+        self.offline_urls: List[str] = []  # URL prefixes that time out, e.g. one Google API down
+        self.cal_page_size = 250
         self.refuse: Dict[Tuple[str, str], Tuple[int, str]] = {}  # (method, url) -> (status, reason)
         self.reject_access_once = False
         self.token_scope = ALL_SCOPES
@@ -107,6 +115,8 @@ class FakeGoogle:
             raw = body.decode("utf-8")
             payload = json.loads(raw) if raw.startswith(("{", "[")) else dict(urllib.parse.parse_qsl(raw))
         self.calls.append((method, base, params, payload))
+        if any(base.startswith(prefix) for prefix in self.offline_urls):
+            raise OSError("timed out")
         if base == TOKEN_URL:
             return self._token(payload or {})
         if headers.get("Authorization") != "Bearer at-1":
@@ -150,7 +160,16 @@ class FakeGoogle:
         if prop:
             key, _, value = prop.partition("=")
             items = [e for e in items if ((e.get("extendedProperties") or {}).get("private") or {}).get(key) == value]
-        return _json(200, {"items": items})
+        if params.get("updatedMin"):
+            items = [e for e in items if _when(e.get("updated")) >= _when(params["updatedMin"])]
+        if params.get("orderBy") == "updated":
+            items.sort(key=lambda e: _when(e.get("updated")))
+        start = int(params.get("pageToken") or 0)
+        size = min(int(params.get("maxResults") or 250), self.cal_page_size)
+        page = {"items": items[start:start + size]}
+        if start + size < len(items):
+            page["nextPageToken"] = str(start + size)
+        return _json(200, page)
 
     def _cal_get(self, tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
         event = self.events.get(urllib.parse.unquote(tail))
@@ -166,7 +185,7 @@ class FakeGoogle:
         event.update(payload or {})
         self._etag += 1
         event["etag"] = f'"{self._etag}"'
-        event["updated"] = "2099-01-01T00:00:00Z"  # Google moves `updated` on every change
+        event["updated"] = f"2099-01-01T00:00:{self._etag % 60:02d}.000Z"  # Google moves `updated` on every change
         return _json(200, event)
 
     def _cal_insert(self, _tail: str, _p: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
@@ -250,11 +269,26 @@ class FakeGoogle:
     def _sheet_post(self, tail: str, params: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
         if tail.endswith(":batchUpdate"):
             sheet_id = urllib.parse.unquote(tail).split(":")[0]
-            for request in (payload or {}).get("requests") or []:
-                rng = request["insertDimension"]["range"]
-                assert rng["sheetId"] == 7 and rng["dimension"] == "ROWS", request
-                for _ in range(rng["endIndex"] - rng["startIndex"]):
-                    self.sheets[sheet_id].insert(rng["startIndex"], [])
+            requests = (payload or {}).get("requests") or []
+            if self.fail_cell_writes and any("updateCells" in r for r in requests):
+                return _error(503, "backendError")  # batchUpdate is all or nothing: nothing applied
+            rows = self.sheets[sheet_id]
+            for request in requests:
+                if "insertDimension" in request:
+                    rng = request["insertDimension"]["range"]
+                    assert rng["sheetId"] == 7 and rng["dimension"] == "ROWS", request
+                    for _ in range(rng["endIndex"] - rng["startIndex"]):
+                        rows.insert(rng["startIndex"], [])
+                    continue
+                update = request["updateCells"]
+                assert update["start"]["sheetId"] == 7 and update["fields"] == "userEnteredValue", request
+                values = [[c["userEnteredValue"]["stringValue"] for c in r["values"]] for r in update["rows"]]
+                self.sheet_writes.append({"valueInputOption": "RAW", "body": {"values": values}})
+                for offset, row in enumerate(values):
+                    index = update["start"]["rowIndex"] + offset
+                    while len(rows) <= index:
+                        rows.append([])
+                    rows[index] = list(row)
             return _json(200, {})
         sheet_id, _, rest = tail.partition("/values/")
         assert rest.endswith(":append"), tail
@@ -269,6 +303,8 @@ class FakeGoogle:
         return _json(200, {"updates": {"updatedRange": f"'Sheet 1'!A{start}:A{end}"}})
 
     def _sheet_update(self, tail: str, params: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
+        if self.fail_cell_writes:
+            return _error(503, "backendError")
         sheet_id, _, rest = tail.partition("/values/")
         self.sheet_writes.append({"valueInputOption": params.get("valueInputOption"), "body": payload})
         rows = self.sheets[sheet_id]

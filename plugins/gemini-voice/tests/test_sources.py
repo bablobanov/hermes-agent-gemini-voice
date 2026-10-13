@@ -96,11 +96,16 @@ class OwnerBoundaryTests(unittest.TestCase):
     def test_calendar_listing_is_not_expanded_and_reports_truncation(self):
         fake = FakeGoogle()
         fake.add_event("Афоня", created=NEW, recurrence=["RRULE:FREQ=DAILY"])
-        verdicts, complete = sources.Calendar(make_client(fake)).candidates(PATTERNS, SINCE, SINCE)
+        verdicts, cut_at = sources.Calendar(make_client(fake)).candidates(PATTERNS, SINCE, SINCE)
         listing = [c for c in fake.calls if c[0] == "GET" and c[1] == sources.CAL_EVENTS][-1]
         self.assertEqual(listing[2]["singleEvents"], "false")
-        self.assertTrue(complete)
+        self.assertIsNone(cut_at)  # complete
         self.assertEqual([v.reason for v in verdicts], ["recurring"])
+        fake.cal_page_size = 1
+        for minute in range(1, 8):
+            fake.add_event("встреча", created=NEW, updated=f"2026-10-13T18:{minute:02d}:00Z")
+        _, cut_at = sources.Calendar(make_client(fake)).candidates(PATTERNS, SINCE, SINCE)
+        self.assertEqual(cut_at, datetime(2026, 10, 13, 18, 4, tzinfo=timezone.utc))  # the 5th page's change
 
     def test_paged_reports_an_incomplete_listing(self):
         class Endless:
@@ -117,6 +122,21 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertEqual(drive.recheck(doc), "")
         fake.files[doc]["shared"] = True
         self.assertEqual(drive.recheck(doc), "shared")
+
+    def test_calendar_recheck_forgives_only_our_own_last_write(self):
+        fake = FakeGoogle()
+        event_id = fake.add_event("Афоня", created=NEW)
+        cal = sources.Calendar(make_client(fake))
+        fake.events[event_id]["updated"] = "2026-10-13T17:40:00Z"  # an edit half an hour after creation
+        self.assertEqual(cal.recheck(event_id), "edited_after_creation")
+        _, locator = cal.write(event_id, ACK, None)  # our acknowledgement is now the last change
+        self.assertEqual(cal.recheck(event_id, locator["updated"]), "")
+        fake.events[event_id]["updated"] = "2099-02-01T00:00:00Z"  # someone edits after it
+        self.assertEqual(cal.recheck(event_id, locator["updated"]), "edited_after_creation")
+
+    def test_signed_output_title_is_never_a_task(self):
+        self.assertEqual(reason(sources.check_file(drive_file(name="[Hermes digest] Афоня: сводка"), PATTERNS,
+                                                   SINCE, [])), "plugin_output")
 
 
 class CalendarWriteTests(unittest.TestCase):
@@ -175,6 +195,10 @@ class CalendarWriteTests(unittest.TestCase):
         self.assertEqual(fake.events[event_id]["description"],
                          "Список<br><b>дел</b><br><br>\n[Hermes] reply:<br>\nA &amp; B")
         self.assertEqual(sources.html_to_text("a<br>b &amp; <b>c</b>"), "a\nb & c")
+        # text in angle brackets that is not a formatting tag is the owner's text
+        self.assertEqual(sources.html_to_text("позвони <Сергею> <br>и <срочно!>"), "позвони <Сергею> \nи <срочно!>")
+        self.assertEqual(sources.html_to_text("a <b> c"), "a  c")
+        self.assertEqual(sources.html_to_text("если x<y и y>z"), "если x<y и y>z")  # not HTML at all
 
     def test_read_excludes_only_our_block(self):
         fake = FakeGoogle()
@@ -214,8 +238,35 @@ class DocsTests(unittest.TestCase):
         fake = FakeGoogle()
         doc_id = fake.add_doc("Афоня", "текст", created=NEW)
         docs = sources.Docs(make_client(fake))
-        docs.write(doc_id, textutil.block("reply:", "ответ"), {"text": "[Hermes] не тот текст"})
+        docs.write(doc_id, textutil.block("reply:", "ответ"), {"text": "[Hermes] не тот текст", "start": 1})
         self.assertEqual(fake.doc_text(doc_id), "текст\n[Hermes] reply:\nответ\n")
+
+    def test_owner_copy_of_our_block_is_never_taken_for_it(self):
+        fake = FakeGoogle()
+        doc_id = fake.add_doc("Афоня", "текст", created=NEW)
+        docs = sources.Docs(make_client(fake))
+        _, locator = docs.write(doc_id, ACK, None)
+        self.assertEqual(locator, {"text": ACK, "start": 7})
+        fake.docs[doc_id]["text"] += ACK + "\n"  # the owner pastes the same line below ours
+        docs.write(doc_id, textutil.block("reply:", "ответ"), locator)
+        self.assertEqual(fake.doc_text(doc_id), "текст\n[Hermes] reply:\nответ\n[Hermes] got it\n")
+
+    def test_text_inserted_above_our_block_means_append(self):
+        fake = FakeGoogle()
+        doc_id = fake.add_doc("Афоня", "текст", created=NEW)
+        docs = sources.Docs(make_client(fake))
+        _, locator = docs.write(doc_id, ACK, None)
+        fake.docs[doc_id]["text"] = "вставка\n" + fake.doc_text(doc_id)  # our block moved: not ours to touch
+        docs.write(doc_id, textutil.block("reply:", "ответ"), locator)
+        self.assertEqual(fake.doc_text(doc_id), "вставка\nтекст\n[Hermes] got it\n[Hermes] reply:\nответ\n")
+
+    def test_block_lines_must_be_adjacent_paragraphs(self):
+        block = textutil.block("reply:", "строка")
+        adjacent = [(1, 17, "[Hermes] reply:\n"), (17, 24, "строка\n")]
+        split_by_table = [(1, 17, "[Hermes] reply:\n"), (40, 47, "строка\n")]  # a table sits in 17..40
+        self.assertEqual(sources.find_block(adjacent, block, 1), (1, 23))
+        self.assertIsNone(sources.find_block(split_by_table, block, 1))
+        self.assertIsNone(sources.find_block(adjacent, block, 17))  # not where we wrote it
 
     def test_empty_document_and_revision_guard(self):
         fake = FakeGoogle()
@@ -268,11 +319,33 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(sheets.read(sheet_id, "Афоня", locator), "Афоня\na, b")
 
     def test_long_lines_are_wrapped_and_capped(self):
-        lines = sources.sheet_lines(("слово " * 400).strip() + "\n" + "\n".join(["x"] * 500))
+        lines = sources.sheet_lines(("слово " * 400).strip() + "\n" + "\n".join(["x"] * 500), "(сокращено)")
         self.assertTrue(all(len(line) <= sources.SHEET_CELL_LIMIT for line in lines))
         self.assertEqual(len(lines), sources.SHEET_MAX_ROWS)
+        self.assertEqual(lines[-1], "(сокращено)")  # the cut is said, not silent
         self.assertEqual(sources.quote_sheet("Bob's list"), "'Bob''s list'")
         self.assertEqual(sources.first_row("'Sheet 1'!A12:A14"), 12)
+        self.assertEqual(sources.first_row("'Итог!A1'!A12:A14"), 12)  # a "!" inside the sheet name
+        self.assertEqual(sources.first_row("A3"), 3)
+
+    def test_failed_reply_write_leaves_no_empty_rows(self):
+        fake = FakeGoogle()
+        sheet_id = fake.add_sheet("Афоня", [["a"]], created=NEW)
+        sheets = sources.Sheets(make_client(fake))
+        _, locator = sheets.write(sheet_id, ACK, None)
+        fake.fail_cell_writes = True
+        with self.assertRaises(api.TransientError):
+            sheets.write(sheet_id, textutil.block("reply:", "1\n2\n3"), locator)
+        self.assertEqual(fake.sheets[sheet_id], [["a"], [ACK]])  # one atomic batchUpdate: nothing half-done
+        self.assertFalse([c for c in fake.calls if c[0] == "PUT"])
+
+    def test_reading_says_when_the_sheet_was_cut(self):
+        fake = FakeGoogle()
+        sheet_id = fake.add_sheet("Афоня", [[f"r{i}"] for i in range(1, 601)], created=NEW)
+        text = sources.Sheets(make_client(fake)).read(sheet_id, "Афоня")
+        self.assertTrue(text.endswith("[only rows 1-500 and columns A-Z of the sheet were read]"))
+        small = fake.add_sheet("Афоня", [["a"]], created=NEW)
+        self.assertEqual(sources.Sheets(make_client(fake)).read(small, "Афоня"), "Афоня\na")
 
 
 class OutputEventTests(unittest.TestCase):

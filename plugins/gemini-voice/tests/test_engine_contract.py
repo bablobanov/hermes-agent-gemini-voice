@@ -34,7 +34,7 @@ class EngineContractTests(unittest.TestCase):
         results = json.loads(proc.stdout.strip().splitlines()[-1])
         failed = {name: detail for name, (ok, detail) in results.items() if not ok}
         self.assertEqual(failed, {})
-        self.assertGreaterEqual(len(results), 26)
+        self.assertGreaterEqual(len(results), 36)
 
 
 if __name__ == "__main__":

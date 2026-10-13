@@ -21,10 +21,15 @@ def install(plugin_dir: Path, home: Path) -> None:
 
 
 class StubBridge:
-    def __init__(self):
+    """Takes anchored replies; an anchorless one only while ``inherited`` (a resumed turn) is set."""
+
+    def __init__(self, inherited=False):
         self.answers, self.outputs, self.completed = [], [], []
+        self.inherited = inherited
 
     async def deliver_answer(self, reply_to, content):
+        if not reply_to and not self.inherited:
+            return False
         self.answers.append((reply_to, content))
         return True
 
@@ -36,7 +41,7 @@ class StubBridge:
         self.completed.append((message_id, outcome))
 
 
-async def full_turn(adapter, stub, task_cls) -> dict:
+async def full_turn(adapter, stub, task, reply="final **answer**") -> dict:
     """A real gateway admission and background turn on the adapter, with a stand-in message handler."""
     seen = {}
 
@@ -44,17 +49,91 @@ async def full_turn(adapter, stub, task_cls) -> dict:
         seen["text"] = event.text
         seen["busy_during_turn"] = adapter._owner_session_busy()
         seen["control"] = event.allow_gateway_control
-        return "final **answer**"
+        return reply
 
     adapter.set_message_handler(handler)
-    await adapter._dispatch(task_cls("doc.turn1", "doc", "t", "the task text"))
+    done_before = len(stub.completed)
+    await adapter._dispatch(task)
     for _ in range(200):
         await asyncio.sleep(0.01)
-        if stub.completed:
+        if len(stub.completed) > done_before:
             break
     await asyncio.sleep(0.05)
     seen["busy_after_turn"] = adapter._owner_session_busy()
     return seen
+
+
+def refused(result) -> bool:
+    return result.success is False and str(result.error).startswith("gemini-voice: ") and not result.retryable
+
+
+def send_checks(adapter, stub) -> dict:
+    """What each kind of outbound message in the voice chat becomes (see adapter.send)."""
+    from gateway.delivery_ledger import RECONNECTED_MARKER, RECOVERED_MARKER
+    results: dict = {}
+    run = asyncio.run
+    final = run(adapter.send("owner", "final", reply_to="doc.x", metadata={"notify": True}))
+    progress = run(adapter.send("owner", "progress", metadata={"_interim_send": True}))
+    after_progress = (len(stub.answers), len(stub.outputs))
+    approval = run(adapter.send("owner", "approve?", metadata={"is_approval_prompt": True}))
+    output = run(adapter.send("event-0800", "digest", metadata={"notify": True, "job_id": "j"}))
+    to_owner = run(adapter.send("owner", "digest", metadata={"notify": True, "job_id": "j"}))
+    other_chat = run(adapter.send("owner", "hello from Telegram"))  # send_message tool, unmarked replay
+    stray = run(adapter.send("owner", "https://x.example/c.png", metadata={"notify": True}))  # no anchor
+    recovered = run(adapter.send("owner", RECOVERED_MARKER + "lost final reply"))
+    results["final reply routed"] = [final.success and stub.answers[0] == ("doc.x", "final"), repr(stub.answers)]
+    results["progress dropped"] = [progress.success and after_progress == (1, 0), repr(after_progress)]
+    results["approval refused"] = [refused(approval), str(approval.error)]
+    results["cron output routed"] = [output.success and stub.outputs == [("event-0800", "digest")], repr(stub.outputs)]
+    results["cron to voice chat refused"] = [refused(to_owner), str(to_owner.error)]
+    results["unmarked message refused, not swallowed"] = [refused(other_chat), str(other_chat.error)]
+    results["anchorless final refused outside a resumed turn"] = [refused(stray), str(stray.error)]
+    results["redelivery refused outside a resumed turn"] = [refused(recovered), str(recovered.error)]
+    stub.inherited = True
+    reconnected = run(adapter.send("owner", RECONNECTED_MARKER + "cut-off reply"))
+    resumed = run(adapter.send("owner", "resumed reply", metadata={"notify": True}))
+    stub.inherited = False
+    results["redelivery goes to the resumed task"] = [
+        reconnected.success and stub.answers[-2] == (None, "cut-off reply"), repr(stub.answers[-2:])]
+    results["resumed final goes to the resumed task"] = [
+        resumed.success and stub.answers[-1] == (None, "resumed reply"), repr(stub.answers[-1])]
+    calls = []
+    original = adapter.send
+
+    async def counting(*args, **kwargs):
+        calls.append(kwargs.get("content", args[1] if len(args) > 1 else None))
+        return await original(*args, **kwargs)
+    adapter.send = counting
+    retried = run(adapter._send_with_retry(chat_id="owner", content="x", reply_to=None, metadata=None))
+    del adapter.send
+    results["refusal is final: no retry, no plain-text resend"] = [refused(retried) and calls == ["x"], repr(calls)]
+    image = run(adapter.send_image(chat_id="owner", image_url="https://x.example/c.png", metadata={"notify": True}))
+    document = run(adapter.send_document(chat_id="owner", file_path="/tmp/a.pdf", metadata={"notify": True}))
+    batch = run(adapter.send_multiple_images("owner", [("https://x.example/c.png", "chart")], metadata={"notify": True}))
+    results["attachments refused"] = [refused(image) and refused(document) and not batch.success,
+                                      f"{image.error} | {batch.error}"]
+    return results
+
+
+def busy_checks(adapter) -> dict:
+    """When the voice queue must wait: the restore gate and a live turn; a guard left by a dead turn not."""
+    from types import SimpleNamespace
+    results: dict = {}
+    key = adapter._source_session_key(adapter._owner_source())
+    adapter.gateway_runner = SimpleNamespace(_startup_restore_in_progress=True)
+    gate = adapter._owner_session_busy()
+    adapter.gateway_runner = None
+    adapter._active_sessions[key] = asyncio.Event()
+    adapter._session_tasks[key] = SimpleNamespace(done=lambda: False)
+    live = adapter._owner_session_busy()
+    adapter._session_tasks[key] = SimpleNamespace(done=lambda: True)
+    stale = adapter._owner_session_busy()
+    adapter._active_sessions.pop(key, None)
+    adapter._session_tasks.pop(key, None)
+    results["restore gate holds new tasks"] = [gate is True, repr(gate)]
+    results["running turn holds new tasks"] = [live is True, repr(live)]
+    results["guard of an ended turn does not"] = [stale is False, repr(stale)]
+    return results
 
 
 def probe() -> dict:
@@ -90,27 +169,15 @@ def probe() -> dict:
 
     stub = StubBridge()
     adapter._bridge = stub
-    final = asyncio.run(adapter.send("owner", "final", reply_to="doc.x", metadata={"notify": True}))
-    progress = asyncio.run(adapter.send("owner", "progress", metadata={"_interim_send": True}))
-    after_progress = (len(stub.answers), len(stub.outputs))
-    approval = asyncio.run(adapter.send("owner", "approve?", metadata={"is_approval_prompt": True}))
-    output = asyncio.run(adapter.send("event-0800", "digest", metadata={"notify": True, "job_id": "j"}))
-    to_owner = asyncio.run(adapter.send("owner", "digest", metadata={"notify": True, "job_id": "j"}))
-    from gateway.delivery_ledger import RECOVERED_MARKER
-    asyncio.run(adapter.send("owner", RECOVERED_MARKER + "lost final reply"))
-    results["final reply routed"] = [final.success and stub.answers[0] == ("doc.x", "final"), repr(stub.answers)]
-    results["progress dropped"] = [progress.success and after_progress == (1, 0), repr(after_progress)]
-    results["approval refused"] = [approval.success is False, str(approval.error)]
-    results["cron output routed"] = [output.success and stub.outputs == [("event-0800", "digest")], repr(stub.outputs)]
-    results["cron to voice chat refused"] = [to_owner.success is False, str(to_owner.error)]
-    results["recovered reply routed"] = [stub.answers[-1] == (None, "lost final reply"), repr(stub.answers[-1])]
+    results.update(send_checks(adapter, stub))
+    results.update(busy_checks(adapter))
     results["interactive resume"] = [type(adapter).interactive_resume is True, ""]
 
     from importlib import import_module
-    bridge_module = import_module(type(adapter).__module__.rsplit(".", 1)[0] + ".bridge")
+    task_cls = import_module(type(adapter).__module__.rsplit(".", 1)[0] + ".bridge").Task
     turn_stub = StubBridge()
     adapter._bridge = turn_stub
-    seen = asyncio.run(full_turn(adapter, turn_stub, bridge_module.Task))
+    seen = asyncio.run(full_turn(adapter, turn_stub, task_cls("doc.turn1", "doc", "t", "the task text")))
     results["gateway accepted the task"] = [seen.get("text") == "the task text", repr(seen.get("text"))]
     results["no gateway control from voice"] = [seen.get("control") is False, repr(seen.get("control"))]
     results["session busy during turn"] = [seen.get("busy_during_turn") is True, repr(seen.get("busy_during_turn"))]
@@ -118,6 +185,13 @@ def probe() -> dict:
     results["real final send has notify and anchor"] = [
         bool(turn_stub.answers) and turn_stub.answers[0][0] == "doc.turn1", repr(turn_stub.answers)]
     results["turn completion reported"] = [turn_stub.completed == [("doc.turn1", "success")], repr(turn_stub.completed)]
+    # A real turn whose reply carries an image: the image must not replace the written reply.
+    media_stub = StubBridge()
+    adapter._bridge = media_stub
+    asyncio.run(full_turn(adapter, media_stub, task_cls("doc.turn2", "doc", "t", "chart please"),
+                          reply="Here it is ![chart](https://x.example/chart.png)"))
+    results["attachment after the reply never replaces it"] = [
+        media_stub.answers == [("doc.turn2", "Here it is")], repr(media_stub.answers)]
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

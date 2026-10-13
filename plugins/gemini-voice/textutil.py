@@ -87,11 +87,11 @@ def is_output(text: Optional[str]) -> bool:
 
 
 def remove_suffix_block(text: str, block_text: Optional[str]) -> str:
-    """``text`` without the exact block this plugin last wrote, when that block is still there."""
-    if not block_text:
+    """``text`` without the exact block this plugin last wrote, when that block is still its very end.
+    The same text anywhere else is left alone: it may be the owner's."""
+    if not block_text or not text.endswith(block_text):
         return text
-    at = text.rfind(block_text)
-    return text if at < 0 else (text[:at] + text[at + len(block_text):])
+    return text[:-len(block_text)]
 
 
 def block(header: str, body: str = "") -> str:

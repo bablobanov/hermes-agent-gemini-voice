@@ -20,12 +20,29 @@ from .google_api import GoogleClient, TokenSource
 logger = logging.getLogger("gemini_voice")
 
 OWNER_NAME = "Owner (Gemini voice)"
-# The delivery ledger's boot-time redelivery of a final reply cut off by a crash (gateway/delivery_ledger.py).
+# Every redelivery marker of the gateway's delivery ledger starts like this (gateway/delivery_ledger.py):
+# a final reply that was cut off by a restart, a reconnect or a rate limit, sent again without its anchor.
 RECOVERED_PREFIX = "♻️ Recovered reply"
+# Prefix of this adapter's refusals: final, never retried, never re-sent as plain text.
+REFUSED = "gemini-voice: "
+NOT_A_TARGET = ("the voice chat only takes the final reply of a voice task; deliver to gemini_voice:doc "
+                "(a new document) or gemini_voice:event-HHMM (an event at that local time)")
+NO_ATTACHMENTS = "files, images and audio are not delivered on the voice channel; put the content into the text"
 
 
 def _message_id() -> str:
     return f"gv-{int(time.time() * 1000)}"
+
+
+def _refuse(reason: str) -> SendResult:
+    return SendResult(success=False, error=REFUSED + reason, retryable=False)
+
+
+def _strip_recovered(content: str) -> Optional[str]:
+    """The reply inside a delivery-ledger redelivery, or None when ``content`` is not one."""
+    if not content.startswith(RECOVERED_PREFIX):
+        return None
+    return content.split("\n\n", 1)[1] if "\n\n" in content else ""
 
 
 def _log_poller_end(task: "asyncio.Task[Any]") -> None:
@@ -83,6 +100,8 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Success means the text is in the journal and will be written into a Google object. Anything the
+        voice chat cannot take is refused for good (see ``_send_retry_is_final``), never reported as sent."""
         meta = metadata or {}
         bridge = self._bridge
         if bridge is None:
@@ -91,15 +110,54 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
             ok, ref = await bridge.deliver_output(str(chat_id), content)
             return SendResult(success=ok, message_id=ref if ok else None, error=None if ok else ref)
         if meta.get("job_id"):
-            return SendResult(success=False, error="the voice chat is not a delivery target; use doc or event-HHMM")
+            return _refuse(NOT_A_TARGET)
         if meta.get("is_approval_prompt"):
             # Nobody can press Approve by voice: the engine waits approvals.timeout, then refuses.
-            return SendResult(success=False, error="approval prompts cannot be answered on the voice channel")
-        if meta.get("notify"):  # only the final reply of a turn goes into the task object
-            await bridge.deliver_answer(reply_to, content)
-        elif content.startswith(RECOVERED_PREFIX):
-            await bridge.deliver_answer(None, content.split("\n\n", 1)[-1])
-        return SendResult(success=True, message_id=_message_id())
+            return _refuse("approval prompts cannot be answered on the voice channel")
+        if meta.get("_interim_send"):
+            return SendResult(success=True, message_id=_message_id())  # mid-turn status: not shown here by design
+        recovered = None if meta.get("notify") else _strip_recovered(content)
+        if meta.get("notify"):  # the final reply of a turn; anchorless only for a turn resumed after a restart
+            ok = await bridge.deliver_answer(reply_to, content)
+        elif recovered is not None:  # a final reply the delivery ledger sends again, without its anchor
+            ok = await bridge.deliver_answer(None, recovered)
+        else:  # e.g. send_message from another chat, or a turn-error notice
+            return _refuse(NOT_A_TARGET)
+        return SendResult(success=True, message_id=_message_id()) if ok else _refuse("no voice task takes this reply")
+
+    def _send_retry_is_final(self, result: SendResult) -> bool:
+        """Our refusals are final: a retry or the plain-text fallback would only repeat them."""
+        return str(getattr(result, "error", "") or "").startswith(REFUSED)
+
+    # Attachments have no place in a Google object read aloud. The engine's defaults would send their URL
+    # or a failure notice as plain text without an anchor; refuse them here instead.
+    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
+
+    async def send_animation(self, chat_id: str, animation_url: str, caption: Optional[str] = None,
+                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                              **kwargs: Any) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[Dict[str, Any]] = None, **kwargs: Any) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                         **kwargs: Any) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                         **kwargs: Any) -> SendResult:
+        return _refuse(NO_ATTACHMENTS)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         name = "Gemini voice" if str(chat_id) == OWNER_CHAT else f"Google {chat_id}"
@@ -124,10 +182,18 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
                                  user_id=OWNER_CHAT, user_name=OWNER_NAME, message_id=message_id)
 
     def _owner_session_busy(self) -> bool:
-        """Whether the gateway is still processing a turn in the voice chat."""
+        """Whether a new task must wait: the gateway is still resuming turns cut off by a restart (a task
+        handed over now would only be parked and its turn reported empty), or a turn in the voice chat is
+        running. A guard whose turn has already ended is not busy: handing the next task over through
+        ``handle_message`` is what makes the gateway heal such a guard."""
+        if getattr(getattr(self, "gateway_runner", None), "_startup_restore_in_progress", False) is True:
+            return True
         if self._owner_key is None:
             self._owner_key = self._source_session_key(self._owner_source())
-        return self._owner_key in getattr(self, "_active_sessions", {})
+        if self._owner_key not in getattr(self, "_active_sessions", {}):
+            return False
+        stale = getattr(self, "_session_task_is_stale", None)
+        return not (callable(stale) and stale(self._owner_key))
 
     async def _dispatch(self, task: Task) -> None:
         source = self._owner_source(task.key)

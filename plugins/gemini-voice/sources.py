@@ -4,9 +4,10 @@ Ownership is decided only from fields the Google API returns for the authorized 
 created by someone else (an invitation, a shared file, an event another person put on a shared
 calendar) is rejected here and never reaches Hermes, whatever its title says.
 
-Writes never search for markers. Every write returns a *locator*: the exact text (and, for Sheets, the
-row) it wrote. The next write replaces exactly that, if it is still there unchanged; otherwise it
-appends. Nothing the owner wrote is ever deleted or overwritten.
+Writes never search for markers. Every write returns a *locator*: the exact text it wrote and where (the
+end of an event description, the start index in a Doc, the row in a Sheet). The next write replaces exactly
+that, if it is still there unchanged at that place; otherwise it appends. Nothing the owner wrote is ever
+deleted or overwritten.
 """
 
 from __future__ import annotations
@@ -30,13 +31,18 @@ SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 OUTPUT_PROPERTY = "gemini_voice"
 MAX_PAGES = 5
 EDIT_WINDOW = timedelta(minutes=10)
-SHEET_READ_RANGE = "A1:Z500"
+SHEET_READ_ROWS = 500
+SHEET_READ_RANGE = f"A1:Z{SHEET_READ_ROWS}"
+SHEET_READ_COLUMNS = 26
 SHEET_CELL_LIMIT = 1000
 SHEET_MAX_ROWS = 300
-_HTML_HINT = re.compile(r"<(br|p|div|b|i|u|a|ul|ol|li|span)\b|</\w+>", re.IGNORECASE)
+# Only real formatting tags count as HTML; any other text in angle brackets is the owner's text.
+_TAGS = (r"(?:a|b|i|u|s|br|p|div|span|ul|ol|li|strong|em|strike|del|ins|font|h[1-6]|hr|img|pre|code|"
+         r"blockquote|sub|sup|table|thead|tbody|tr|td|th)")
+_HTML_HINT = re.compile(rf"<{_TAGS}\b[^<>]*>|</{_TAGS}\s*>", re.IGNORECASE)
 _HTML_BREAK = re.compile(r"<\s*br\s*/?\s*>|</\s*(p|div|li)\s*>", re.IGNORECASE)
-_HTML_TAG = re.compile(r"<[^>]+>")
-_ROW = re.compile(r"!\$?[A-Z]+\$?(\d+)")
+_HTML_TAG = re.compile(rf"</?{_TAGS}\b[^<>]*>", re.IGNORECASE)
+_ROW = re.compile(r"^\$?[A-Z]+\$?(\d+)")
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 Locator = Dict[str, Any]
@@ -145,18 +151,31 @@ class Calendar:
         self.client = client
 
     def candidates(self, patterns: Sequence[re.Pattern], not_before: datetime,
-                   updated_min: datetime) -> Tuple[List[Verdict], bool]:
+                   updated_min: datetime) -> Tuple[List[Verdict], Optional[datetime]]:
+        """Verdicts on events changed since ``updated_min``, and None when the listing was complete or,
+        when ``MAX_PAGES`` cut it, the last change it reached (the listing is sorted by ``updated``)."""
         # singleEvents=false: a recurring series is one item (and rejected), never hundreds of instances.
         params = {"updatedMin": rfc3339(updated_min), "singleEvents": "false", "showDeleted": "false",
                   "maxResults": 250, "orderBy": "updated"}
         items, complete = _paged(self.client, CAL_EVENTS, params, "items")
-        return [check_event(e, patterns, not_before) for e in items], complete
+        verdicts = [check_event(e, patterns, not_before) for e in items]
+        if complete:
+            return verdicts, None
+        stamps = [t for t in (parse_time(e.get("updated")) for e in items) if t]
+        return verdicts, max(stamps, default=updated_min)
 
     def _get(self, event_id: str) -> dict:
         return self.client.request("GET", f"{CAL_EVENTS}/{_quote(event_id)}").body
 
-    def recheck(self, event_id: str) -> str:
-        return event_problem(self._get(event_id))
+    def recheck(self, event_id: str, own_update: Optional[str] = None) -> str:
+        """Ownership again, right before the task starts. ``own_update`` is the ``updated`` stamp our own
+        acknowledgement produced: a later edit is forgiven only while it is exactly that one."""
+        event = self._get(event_id)
+        problem = event_problem(event)
+        ours = parse_time(own_update)
+        if problem == "edited_after_creation" and ours is not None and parse_time(event.get("updated")) == ours:
+            return ""
+        return problem
 
     def read(self, event_id: str, previous: Optional[Locator] = None) -> str:
         event = self._get(event_id)
@@ -169,16 +188,17 @@ class Calendar:
         return "\n".join(p for p in parts if p)
 
     def write(self, event_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
-        """Replace our previous block if it is still the exact end of the description, else append."""
+        """Replace our previous block if it is still the exact end of the description, else append. The
+        locator keeps the ``updated`` stamp of this write: the proof that the last change is ours."""
         for _ in range(3):
             event = self._get(event_id)
             description, suffix = merge_description(event.get("description") or "", block_text,
                                                     (previous or {}).get("suffix"))
             try:
-                status = self.client.request(
+                resp = self.client.request(
                     "PATCH", f"{CAL_EVENTS}/{_quote(event_id)}", params={"sendUpdates": "none"},
-                    body={"description": description}, headers={"If-Match": str(event.get("etag") or "*")}).status
-                return status, {"suffix": suffix}
+                    body={"description": description}, headers={"If-Match": str(event.get("etag") or "*")})
+                return resp.status, {"suffix": suffix, "updated": str((resp.body or {}).get("updated") or "")}
             except ApiError as exc:
                 if exc.status != 412:
                     raise
@@ -187,7 +207,9 @@ class Calendar:
 
 def merge_description(existing: str, block_text: str, previous_suffix: Optional[str]) -> Tuple[str, str]:
     """``(new description, suffix written)``. Our previous suffix is replaced only when it is still the
-    exact end of the description. HTML descriptions keep each block line on its own text line."""
+    exact end of the description: the only text that can be mistaken for it is a verbatim copy of our own
+    block at the very end, so nothing of the owner's is lost. HTML descriptions keep each block line on its
+    own text line."""
     base = existing[:-len(previous_suffix)] if previous_suffix and existing.endswith(previous_suffix) else existing
     if _HTML_HINT.search(base):
         rendered = "<br>\n".join(html.escape(line, quote=False) for line in block_text.split("\n"))
@@ -215,7 +237,8 @@ def check_file(item: dict, patterns: Sequence[re.Pattern], not_before: datetime,
     kind = {DOC_MIME: "doc", SHEET_MIME: "sheet"}.get(str(item.get("mimeType")), "file")
     obj = VoiceObject(kind, str(item.get("id") or ""), str(item.get("name") or ""),
                       parse_time(item.get("createdTime")) or _EPOCH)
-    reason = _first_failure(((obj.id in outbound, "plugin_output"),)) or file_problem(item) or _first_failure((
+    is_output = obj.id in outbound or textutil.is_output(obj.title)  # the output channel signs titles too
+    reason = _first_failure(((is_output, "plugin_output"),)) or file_problem(item) or _first_failure((
         (obj.created < not_before, "too_old"),
         (not textutil.has_label(obj.title, patterns), "no_label"),
         (not obj.id, "no_id"),
@@ -264,11 +287,14 @@ def _paragraphs(content: Sequence[dict]) -> List[Tuple[int, int, str]]:
     return found
 
 
-def _all_text(content: Sequence[dict]) -> str:
-    """Every paragraph's text, tables and tables of contents included, in document order."""
+def _all_text(content: Sequence[dict], skip: Optional[Tuple[int, int]] = None) -> str:
+    """Every paragraph's text, tables and tables of contents included, in document order; top-level
+    paragraphs starting inside ``skip`` (``[start, end)``, our own block) are left out."""
     parts: List[str] = []
     for element in content or []:
         if "paragraph" in element:
+            if skip and skip[0] <= int(element.get("startIndex") or 0) < skip[1]:
+                continue
             parts.append("".join((r.get("textRun") or {}).get("content", "")
                                  for r in element["paragraph"].get("elements") or []))
         elif "table" in element:
@@ -280,15 +306,26 @@ def _all_text(content: Sequence[dict]) -> str:
     return "".join(parts)
 
 
-def find_block(paragraphs: List[Tuple[int, int, str]], block_text: str) -> Optional[Tuple[int, int]]:
-    """``(start, end)`` of the LAST run of consecutive paragraphs whose text is exactly ``block_text``;
-    ``end`` excludes the final paragraph's newline."""
+def find_block(paragraphs: List[Tuple[int, int, str]], block_text: str, start: int) -> Optional[Tuple[int, int]]:
+    """``(start, end)`` of our block when it is still where we wrote it: adjacent top-level paragraphs that
+    begin exactly at ``start`` and whose text is exactly ``block_text``; ``end`` excludes the last newline.
+    A copy of the same text anywhere else, or a table between the lines, is never taken for it."""
     lines = [line + "\n" for line in block_text.split("\n")]
-    for i in range(len(paragraphs) - len(lines), -1, -1):
-        window = paragraphs[i:i + len(lines)]
-        if [p[2] for p in window] == lines:
-            return window[0][0], window[-1][1] - 1
+    first = next((i for i, p in enumerate(paragraphs) if p[0] == start), None)
+    if first is None:
+        return None
+    window = paragraphs[first:first + len(lines)]
+    adjacent = all(a[1] == b[0] for a, b in zip(window, window[1:]))
+    if len(window) == len(lines) and adjacent and [p[2] for p in window] == lines:
+        return start, window[-1][1] - 1
     return None
+
+
+def _own_block(content: Sequence[dict], previous: Optional[Locator]) -> Optional[Tuple[int, int]]:
+    prev = previous or {}
+    if not prev.get("text") or not isinstance(prev.get("start"), int):
+        return None
+    return find_block(_paragraphs(content), str(prev["text"]), prev["start"])
 
 
 class Docs:
@@ -301,10 +338,10 @@ class Docs:
         return self.client.request("GET", f"{DOCS}/{_quote(doc_id)}").body
 
     def read_body(self, doc_id: str, previous: Optional[Locator] = None) -> str:
-        """The document text without our own last block (the title is not part of it)."""
-        text = _all_text((self._get(doc_id).get("body") or {}).get("content") or [])
-        own = (previous or {}).get("text")
-        return textutil.remove_suffix_block(text, own + "\n" if own else None).strip()
+        """The document text without our own block, if it is still where we wrote it (no title)."""
+        content = (self._get(doc_id).get("body") or {}).get("content") or []
+        own = _own_block(content, previous)
+        return _all_text(content, (own[0], own[1] + 1) if own else None).strip()
 
     def read(self, doc_id: str, title: str, previous: Optional[Locator] = None) -> str:
         return f"{title}\n{self.read_body(doc_id, previous)}".strip()
@@ -312,28 +349,32 @@ class Docs:
     def write(self, doc_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
         for attempt in (1, 2):
             doc = self._get(doc_id)
-            requests = self._requests(doc, block_text, (previous or {}).get("text"))
+            requests, start = self._plan(doc, block_text, previous)
             try:
-                return self._batch(doc_id, requests, doc.get("revisionId")), {"text": block_text}
+                return self._batch(doc_id, requests, doc.get("revisionId")), {"text": block_text, "start": start}
             except ApiError as exc:
                 if exc.status != 400 or attempt == 2:
                     raise  # 400 = the document changed between read and write: once more, fresh
         raise ApiError("conflict", "document kept changing while writing")  # pragma: no cover
 
     @staticmethod
-    def _requests(doc: dict, block_text: str, previous_text: Optional[str]) -> List[dict]:
+    def _plan(doc: dict, block_text: str, previous: Optional[Locator]) -> Tuple[List[dict], int]:
+        """The batchUpdate requests and the index where ``block_text`` will start (Docs indexes)."""
         content = (doc.get("body") or {}).get("content") or []
-        paragraphs = _paragraphs(content)
-        found = find_block(paragraphs, previous_text) if previous_text else None
+        found = _own_block(content, previous)
         if found:
             start, end = found
             requests: List[dict] = []
             if end > start:
                 requests.append({"deleteContentRange": {"range": {"startIndex": start, "endIndex": end}}})
             requests.append({"insertText": {"location": {"index": start}, "text": block_text}})
-            return requests
-        has_text = any(text.strip() for _, _, text in paragraphs)
-        return [{"insertText": {"endOfSegmentLocation": {}, "text": ("\n" if has_text else "") + block_text}}]
+            return requests, start
+        # Appended before the body's final newline; after a separating newline when there is text above.
+        has_text = any(text.strip() for _, _, text in _paragraphs(content))
+        body_end = int((content[-1] if content else {}).get("endIndex") or 2)
+        separator = "\n" if has_text else ""
+        return [{"insertText": {"endOfSegmentLocation": {}, "text": separator + block_text}}], \
+            body_end - 1 + len(separator)
 
     def _batch(self, doc_id: str, requests: List[dict], revision: Optional[str]) -> int:
         body: Dict[str, Any] = {"requests": requests}
@@ -360,8 +401,9 @@ def quote_sheet(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
 
 
-def sheet_lines(block_text: str) -> List[str]:
-    """Block text as cell-sized lines (long paragraphs wrapped), capped at ``SHEET_MAX_ROWS``."""
+def sheet_lines(block_text: str, shortened: str = "(reply shortened)") -> List[str]:
+    """Block text as cell-sized lines (long paragraphs wrapped); past ``SHEET_MAX_ROWS`` the last row says
+    the reply was shortened."""
     lines: List[str] = []
     for paragraph in block_text.split("\n"):
         while len(paragraph) > SHEET_CELL_LIMIT:
@@ -370,19 +412,21 @@ def sheet_lines(block_text: str) -> List[str]:
             lines.append(paragraph[:cut].rstrip())
             paragraph = paragraph[cut:].lstrip()
         lines.append(paragraph)
-    return lines[:SHEET_MAX_ROWS]
+    return lines if len(lines) <= SHEET_MAX_ROWS else lines[:SHEET_MAX_ROWS - 1] + [shortened]
 
 
 def first_row(updated_range: str) -> Optional[int]:
-    match = _ROW.search(updated_range or "")
+    """First row of an A1 range such as ``'Sheet 1'!A12:A14``; the sheet name itself may contain ``!``."""
+    match = _ROW.match((updated_range or "").rsplit("!", 1)[-1])
     return int(match.group(1)) if match else None
 
 
 class Sheets:
     """Task text from the first sheet; replies go into column A. Appends insert rows, never overwrite."""
 
-    def __init__(self, client: GoogleClient):
+    def __init__(self, client: GoogleClient, shortened: str = "(reply shortened)"):
         self.client = client
+        self.shortened = shortened
 
     def _first(self, sheet_id: str) -> Tuple[str, int]:
         body = self.client.request("GET", f"{SHEETS}/{_quote(sheet_id)}",
@@ -403,28 +447,36 @@ class Sheets:
         rows = self._values(sheet_id, f"{quote_sheet(name)}!{SHEET_READ_RANGE}")
         own_row = int((previous or {}).get("row") or 0)
         lines = [", ".join(c for c in row if c.strip()) for i, row in enumerate(rows, 1) if i != own_row]
-        return f"{title}\n" + "\n".join(line for line in lines if line)
+        text = f"{title}\n" + "\n".join(line for line in lines if line)
+        if len(rows) >= SHEET_READ_ROWS or any(len(row) >= SHEET_READ_COLUMNS for row in rows):
+            text += f"\n[only rows 1-{SHEET_READ_ROWS} and columns A-Z of the sheet were read]"
+        return text
 
     def write(self, sheet_id: str, block_text: str, previous: Optional[Locator]) -> Tuple[int, Locator]:
         name, grid_id = self._first(sheet_id)
-        lines = sheet_lines(block_text)
+        lines = sheet_lines(block_text, self.shortened)
         row = int((previous or {}).get("row") or 0)
+        # Sheets has no conditional write: the cell is checked, then rewritten in one atomic batchUpdate
+        # right after, so the owner's edit can only be lost inside that single round trip.
         if row and self._values(sheet_id, f"{quote_sheet(name)}!A{row}") == [[(previous or {}).get("text", "")]]:
-            status = self._replace(sheet_id, name, grid_id, row, lines)
+            status = self._replace(sheet_id, grid_id, row, lines)
             return status, ({"row": row, "text": lines[0]} if len(lines) == 1 else {})
         return self._append(sheet_id, name, lines)
 
-    def _replace(self, sheet_id: str, name: str, grid_id: int, row: int, lines: List[str]) -> int:
-        """Our one-row block at ``row`` becomes ``lines``: new rows are inserted below it first."""
+    def _replace(self, sheet_id: str, grid_id: int, row: int, lines: List[str]) -> int:
+        """Our one-row block at ``row`` becomes ``lines`` in one batchUpdate (all or nothing): rows are
+        inserted below it, then the cells get the lines as plain strings, never parsed as formulas."""
+        requests: List[dict] = []
         if len(lines) > 1:
-            insert = {"insertDimension": {"range": {"sheetId": grid_id, "dimension": "ROWS",
-                                                    "startIndex": row, "endIndex": row + len(lines) - 1},
-                                          "inheritFromBefore": True}}
-            self.client.request("POST", f"{SHEETS}/{_quote(sheet_id)}:batchUpdate", body={"requests": [insert]})
-        target = f"{quote_sheet(name)}!A{row}:A{row + len(lines) - 1}"
-        body = {"range": target, "majorDimension": "ROWS", "values": [[line] for line in lines]}
-        return self.client.request("PUT", f"{SHEETS}/{_quote(sheet_id)}/values/{_quote(target)}",
-                                   params={"valueInputOption": "RAW"}, body=body).status
+            requests.append({"insertDimension": {"range": {"sheetId": grid_id, "dimension": "ROWS",
+                                                           "startIndex": row, "endIndex": row + len(lines) - 1},
+                                                 "inheritFromBefore": True}})
+        requests.append({"updateCells": {
+            "start": {"sheetId": grid_id, "rowIndex": row - 1, "columnIndex": 0},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": line}}]} for line in lines],
+            "fields": "userEnteredValue"}})
+        return self.client.request("POST", f"{SHEETS}/{_quote(sheet_id)}:batchUpdate",
+                                   body={"requests": requests}).status
 
     def _append(self, sheet_id: str, name: str, lines: List[str]) -> Tuple[int, Locator]:
         target = f"{quote_sheet(name)}!A1"

@@ -36,6 +36,8 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(textutil.remove_suffix_block("[Hermes] typed by the owner", "\n\n" + ack),
                          "[Hermes] typed by the owner")
         self.assertEqual(textutil.remove_suffix_block("text", None), "text")
+        # the same text anywhere but the very end may be the owner's: it stays
+        self.assertEqual(textutil.remove_suffix_block("x\n\n" + ack + "\nowner", "\n\n" + ack), "x\n\n" + ack + "\nowner")
 
     def test_output_signature(self):
         self.assertTrue(textutil.is_output("\n[Hermes digest] Радар Gemini\nT1"))

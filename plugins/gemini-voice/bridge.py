@@ -119,20 +119,25 @@ class VoiceBridge:
                  session_busy: Callable[[], bool] = lambda: False):
         self.settings = settings
         self.journal = Journal(store)
+        self._text = textutil.strings(settings.language)
         self.calendar, self.drive = Calendar(client), Drive(client)
-        self.docs, self.sheets, self.calendar_output = Docs(client), Sheets(client), CalendarOutput(client)
+        self.docs, self.calendar_output = Docs(client), CalendarOutput(client)
+        self.sheets = Sheets(client, shortened=self._text["truncated"])
         self._dispatch, self._publish, self._session_busy = dispatch, publish_status, session_busy
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._run = run_blocking or asyncio.to_thread
         self._patterns = textutil.compile_labels(settings.labels)
-        self._text = textutil.strings(settings.language)
         self._zone, self._zone_name = resolve_zone(settings.timezone)
         self._lock = asyncio.Lock()
         self._recovered = False
+        # The task whose gateway turn was open when this process started: the only one a reply without an
+        # anchor (a turn the gateway resumed, or the delivery ledger re-sending a cut-off reply) can go to.
+        self._inherited: Optional[str] = None
         self._auth_failed_at: Optional[datetime] = None
         self._backoff = 0.0
         self._status: Optional[Tuple[str, str]] = None
         self._logged_rejects: set = set()
+        self._drive_cut_logged = False
 
     # ------------------------------------------------------------------------------------ loop
     async def run_forever(self) -> None:
@@ -149,10 +154,21 @@ class VoiceBridge:
             await asyncio.sleep(delay)
 
     def recover(self, now: datetime) -> None:
-        """After a restart: claimed (never dispatched) tasks go back to the queue; dispatched ones stay."""
+        """After a restart: claimed (never dispatched) tasks go back to the queue; dispatched ones stay, and
+        the one whose turn was open is inherited (the gateway may resume that turn without an anchor)."""
         for key in self.journal.with_state("claimed"):
             self.journal.mark(key, "queued", now)
             logger.info("gemini-voice: %s was claimed but not dispatched before the restart; requeued", key)
+        key = self.journal.open_turn()
+        record = self.journal.get(key)
+        self._inherited = key if record is not None and record.get("state") == "dispatched" else None
+        if self._inherited:
+            logger.info("gemini-voice: %s was running before the restart; waiting for the resumed turn", key)
+
+    def _ensure_recovered(self, now: datetime) -> None:
+        if not self._recovered:
+            self.recover(now)
+            self._recovered = True
 
     async def tick(self) -> float:
         """One poll cycle; returns seconds until the next one."""
@@ -161,48 +177,63 @@ class VoiceBridge:
             return float(self.settings.poll_seconds)
         try:
             async with self._lock:
-                if not self._recovered:
-                    self.recover(now)
-                    self._recovered = True
-                problems = await self._poll(now)
-                self._on_success(problems)
-                await self._advance(now)
+                self._ensure_recovered(now)
+                problems, listings = await self._poll(now)
+                await self._advance(now)  # replies and the queue move on even when a listing failed
         except AuthError as exc:
             return self._on_auth_error(exc, now)
         except TransientError as exc:
             return self._on_transient(exc)
         except ApiError as exc:
-            self._on_success([exc])
+            problems, listings = [exc], 0
+        unreachable = [p for p in problems if isinstance(p, TransientError)]
+        if unreachable and len(unreachable) == listings:  # Google answered none of the listings
+            return self._on_transient(unreachable[0])
+        self._on_success(problems)
         return float(self.settings.poll_seconds)
 
     # ---------------------------------------------------------------------------------- polling
-    async def _poll(self, now: datetime) -> List[ApiError]:
-        """List candidates from every source; one refused API does not stop the others."""
+    async def _poll(self, now: datetime) -> Tuple[List[GoogleError], int]:
+        """List candidates from every source; a source Google refuses or does not answer does not stop the
+        others (an authorization error concerns them all and propagates). Returns the problems and how
+        many listings were requested."""
         since = self.journal.since(now)
         not_before = max(since, now - timedelta(hours=self.settings.max_age_hours))
         calendar_mark = self.journal.calendar_updated_min(not_before)
         verdicts: List[Verdict] = []
-        problems: List[ApiError] = []
+        problems: List[GoogleError] = []
+        listings = 0
         if "calendar" in self.settings.sources:
+            listings += 1
             try:
-                found, complete = await self._run(self.calendar.candidates, self._patterns, not_before,
-                                                  max(not_before, calendar_mark - CALENDAR_SKEW))
+                found, cut_at = await self._run(self.calendar.candidates, self._patterns, not_before,
+                                                max(not_before, calendar_mark - CALENDAR_SKEW))
                 verdicts += found
-                calendar_mark = now if complete else calendar_mark  # a cut listing is read again
-            except ApiError as exc:
+                # A cut listing (sorted by ``updated``) goes on from the last change it reached, so the
+                # events behind a burst of changes are read on the next polls instead of never.
+                calendar_mark = now if cut_at is None else max(calendar_mark, cut_at)
+            except (ApiError, TransientError) as exc:
                 problems.append(exc)
         kinds = [k for k, s in (("doc", "docs"), ("sheet", "sheets")) if s in self.settings.sources]
         if kinds:
+            listings += 1
             try:
-                found, _ = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
-                                           self.journal.outbound_ids())
+                found, complete = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
+                                                  self.journal.outbound_ids())
                 verdicts += found
-            except ApiError as exc:
+                self._note_drive_cut(complete)
+            except (ApiError, TransientError) as exc:
                 problems.append(exc)
         for verdict in verdicts:
             self._consider(verdict, now)
         self.journal.poll_ok(now if not problems else None, calendar_mark)
-        return problems
+        return problems, listings
+
+    def _note_drive_cut(self, complete: bool) -> None:
+        """The Drive listing (newest first) reads at most 500 files per poll inside the age window."""
+        if not complete and not self._drive_cut_logged:
+            logger.warning("gemini-voice: more new Docs and Sheets than one poll reads; the oldest are not seen")
+        self._drive_cut_logged = not complete
 
     def _consider(self, verdict: Verdict, now: datetime) -> None:
         obj = verdict.obj
@@ -274,6 +305,7 @@ class VoiceBridge:
         if prompt is None:
             return
         self.journal.count_task(day)
+        self._inherited = None  # a newer turn opens: a reply without an anchor can no longer be placed
         self.journal.mark(key, "dispatched", now, turn_open=True)
         logger.info("gemini-voice: dispatched %s", key)
         try:
@@ -296,7 +328,6 @@ class VoiceBridge:
                 logger.info("gemini-voice: %s is an output of this plugin; not a task", key)
                 self.journal.mark(key, "skipped", now, reason="plugin_output")
                 return None
-            self.journal.mark(key, "claimed", now, acking=True)
             ack = textutil.block(self._text["ack"].format(time=self._local(now)))
             _, locator = await self._run(self._write, record, ack)
         except ApiError as exc:
@@ -319,9 +350,9 @@ class VoiceBridge:
     # ------------------------------------------------------------------------------- Google I/O
     def _recheck(self, record: Dict[str, Any]) -> str:
         if record["kind"] == "cal":
-            problem = self.calendar.recheck(record["id"])
-            # our own earlier acknowledgement moves ``updated``: that edit is ours, not someone else's
-            return "" if problem == "edited_after_creation" and record.get("acking") else problem
+            # Our own acknowledgement moves ``updated``: it is forgiven only while the event's last change
+            # is exactly the one our recorded write produced, never on the intention to write.
+            return self.calendar.recheck(record["id"], (record.get("locator") or {}).get("updated"))
         return self.drive.recheck(record["id"])
 
     def _read(self, record: Dict[str, Any]) -> Tuple[str, bool]:
@@ -371,28 +402,32 @@ class VoiceBridge:
         """The final reply of a voice turn: journal first, then into the task object."""
         async with self._lock:
             now = self._clock()
+            self._ensure_recovered(now)
             key = self._route(reply_to)
             if key is None:
-                logger.warning("gemini-voice: a reply for %s has no task to go to; dropped", reply_to or "no anchor")
+                logger.warning("gemini-voice: a reply for %s has no task to go to; refused", reply_to or "no anchor")
                 return False
             self.journal.mark(key, "answered", now, answer=textutil.plain_text(content))
             await self._write_answer(key, now)
             return True
 
     def _route(self, reply_to: Optional[str]) -> Optional[str]:
-        """The anchor decides. Only an anchorless reply (a turn the gateway resumed after a restart)
-        goes to the task whose turn is open."""
+        """The anchor decides. A reply without one goes only to the inherited task, while that task has no
+        reply yet and no newer task has started; anything else could land in the wrong object."""
         if reply_to:
             return reply_to if self.journal.get(reply_to) is not None else None
-        key = self.journal.open_turn()
-        state = (self.journal.get(key) or {}).get("state")
-        return key if state in ("dispatched", "answered", "done") else None
+        record = self.journal.get(self._inherited)
+        return self._inherited if record is not None and record.get("state") in ("dispatched", "abandoned") else None
 
     async def on_turn_complete(self, message_id: Optional[str], outcome: str, streamed: str = "") -> None:
-        """End of a gateway turn: close a task that ended without a reply; free the queue."""
+        """End of a gateway turn: close a task that ended without a reply; free the queue. A turn without
+        a message id is the gateway resuming the inherited task's turn."""
         async with self._lock:
             now = self._clock()
-            key = message_id if message_id else self.journal.open_turn()
+            self._ensure_recovered(now)
+            key = message_id or self._inherited
+            if not message_id:
+                self._inherited = None
             record = self.journal.get(key)
             if record is None or outcome == "cancelled":
                 return  # a cancelled turn may be resumed by the gateway; the answer timeout still applies
@@ -421,7 +456,9 @@ class VoiceBridge:
                                                        title, body, self._zone, self._zone_name, now)
                     logger.info("gemini-voice: delivered to cal.%s HTTP %s", event_id, status)
                     return True, f"cal.{event_id}"
-                doc_id = await self._run(self.docs.create_blank, title)
+                # The signature is in the title too: if filling fails, even an empty output document is
+                # never read back as a task, with or without the journal (cron outside the gateway).
+                doc_id = await self._run(self.docs.create_blank, f"{textutil.OUTPUT_MARKER} {title}")
                 self.journal.add_outbound(doc_id, now)  # recorded before any text exists in it
                 status = await self._run(self.docs.fill_output, doc_id, title, body)
                 logger.info("gemini-voice: delivered to new doc.%s HTTP %s", doc_id, status)
@@ -444,7 +481,7 @@ class VoiceBridge:
         except Exception:
             logger.warning("gemini-voice: could not save the status to the state file", exc_info=True)
 
-    def _on_success(self, problems: List[ApiError]) -> None:
+    def _on_success(self, problems: List[GoogleError]) -> None:
         if self._auth_failed_at is not None or self._backoff:
             logger.info("gemini-voice: Google reachable and authorized again")
         self._auth_failed_at, self._backoff = None, 0.0
@@ -452,7 +489,10 @@ class VoiceBridge:
             self._set_status("connected", "", "")
             return
         code = problems[0].code
-        if code == "api_disabled":
+        if isinstance(problems[0], TransientError):
+            code, message = "google_unreachable", (f"Google did not answer a polling request ({problems[0].code}); "
+                                                   "the other sources keep working.")
+        elif code == "api_disabled":
             message = "A Google API is disabled: enable Calendar, Drive, Docs and Sheets in the OAuth client's project."
         else:
             message = f"Google refused a polling request ({code}); the other sources keep working."
