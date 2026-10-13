@@ -191,6 +191,17 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertNotEqual(sources.event_fingerprint(plain),
                             sources.event_fingerprint(dict(plain, description="купи хлеб и вино")))
 
+    def test_fingerprint_keeps_line_breaks_and_indentation(self):
+        base = {"summary": "Афоня", "start": {"date": "2026-10-14"}}
+        safe = dict(base, description="echo safe\n# rm -rf data")
+        unsafe = dict(base, description="echo safe #\nrm -rf data")
+        self.assertNotEqual(sources.event_fingerprint(safe), sources.event_fingerprint(unsafe))
+        nested = dict(base, description="steps:\n  - run: a\n- run: b")
+        flat = dict(base, description="steps:\n  - run: a\n  - run: b")
+        self.assertNotEqual(sources.event_fingerprint(nested), sources.event_fingerprint(flat))
+        crlf = dict(base, description="echo safe\r\n# rm -rf data  ")
+        self.assertEqual(sources.event_fingerprint(safe), sources.event_fingerprint(crlf))
+
     def test_any_of_our_suffixes_is_recognised_at_the_end(self):
         fake = FakeGoogle()
         event_id = fake.add_event("Афоня", created=NEW, description="купи хлеб")

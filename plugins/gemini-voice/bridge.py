@@ -58,6 +58,8 @@ class _ClaimView:
     is_output: bool = False
     write: Optional[Callable[[], Tuple[int, Locator]]] = None
     conflict: Optional[int] = None  # the HTTP status meaning "changed since read"
+    moved: Optional[Callable[[], bool]] = None  # after that status: did the object really change?
+    event: Optional[Dict[str, Any]] = None  # the event copy a rejection was decided on
 
 
 def _newest_unique(items: List[str]) -> List[str]:
@@ -322,11 +324,15 @@ class VoiceBridge:
             recent = min(recent, last_head - HEAD_WINDOW)
         found, head_last, head_cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
                                                      outbound, None, MAX_PAGES, recent)
+        if head_cut:  # more new files than a poll usually reads: the head reads deeper, none waits for the walk
+            found, head_last, head_cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
+                                                         outbound, None, DEEP_PAGES, recent)
+            if head_cut:
+                logger.warning("gemini-voice: more new files than %s pages hold; the walk catches up", DEEP_PAGES)
         self.journal.set_cursor("drive_head", {"at": iso(now)})
-        if head_cut and head_last is not None:  # more new files than the head holds: the walk takes over below it
-            before = head_last
-        else:
-            before = from_iso((self.journal.cursor("drive") or {}).get("before")) or recent
+        # The walk keeps its own place; a new one starts below the head.
+        before = from_iso((self.journal.cursor("drive") or {}).get("before")) \
+            or (head_last if head_cut and head_last is not None else recent)
         try:
             more, last, cut = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
                                               outbound, before, MAX_PAGES)
@@ -486,7 +492,7 @@ class VoiceBridge:
     async def _claim_once(self, key: str, record: Dict[str, Any], ack: str, now: datetime) -> Any:
         view = await self._view(key, record, ack)
         if view.problem:
-            await self._reject(key, record, view.problem, now)
+            await self._reject(key, record, view.problem, now, view.event)
             return None
         if view.is_output:
             logger.info("gemini-voice: %s is an output of this plugin; not a task", key)
@@ -497,6 +503,8 @@ class VoiceBridge:
         except ApiError as exc:
             if view.conflict is None or exc.status != view.conflict:
                 raise
+            if view.moved is not None and not await self._run(view.moved):
+                raise  # refused on the very version it was read from: a real error, not a change
             return _CHANGED  # the object changed after it was read: check and read it again
         logger.info("gemini-voice: wrote to %s HTTP %s", key, status)
         self.journal.mark(key, "claimed", now, locator=locator, retry_at=None, retry_code=None)
@@ -511,29 +519,42 @@ class VoiceBridge:
             problem = judge_event(event, [(locator or {}).get("updated")], record.get("ack_fingerprints") or [],
                                   record.get("seen_fingerprint") or "")
             if problem:
-                return _ClaimView(problem)
+                return _ClaimView(problem, event=event)
             plan = plan_event_write(event, ack, locator)
             self._remember_intent(key, record, plan)  # kept before the write: a lost response stays ours
             return _ClaimView("", event_text(event, locator), False, partial(self.calendar.apply, obj_id, plan), 412)
+        if kind == "doc":  # the copy first, then its owner: a change after the check moves the revision
+            doc = await self._run(self.docs.get, obj_id)
+            problem = await self._run(self.drive.recheck, obj_id)
+            if problem:
+                return _ClaimView(problem)
+            body = Docs.body_text(doc, locator)
+            return _ClaimView("", f"{title}\n{body}".strip(), textutil.is_output(body),
+                              partial(self.docs.write_on, obj_id, doc, ack, locator), 400,
+                              partial(self._doc_moved, obj_id, doc.get("revisionId")))
         problem = await self._run(self.drive.recheck, obj_id)
         if problem:
             return _ClaimView(problem)
-        if kind == "doc":
-            doc = await self._run(self.docs.get, obj_id)
-            body = Docs.body_text(doc, locator)
-            return _ClaimView("", f"{title}\n{body}".strip(), textutil.is_output(body),
-                              partial(self.docs.write_on, obj_id, doc, ack, locator), 400)
         text = await self._run(self.sheets.read, obj_id, title, locator)
         return _ClaimView("", text, False, partial(self.sheets.write, obj_id, ack, locator), None)
 
-    async def _reject(self, key: str, record: Dict[str, Any], problem: str, now: datetime) -> None:
+    async def _reject(self, key: str, record: Dict[str, Any], problem: str, now: datetime,
+                      event: Optional[Dict[str, Any]] = None) -> None:
+        """Not started. The owner's own event changed after it was first seen (creator, organizer, no guests:
+        the rest of the check passed) gets a note saying so, written only onto the very copy just checked: if it
+        changed again, or Google does not answer, it gets none. Anything else is someone else's: nothing written."""
         logger.info("gemini-voice: ignored %s (%s): changed before it started", key, problem)
-        if record["kind"] == "cal" and problem == "edited_after_creation":
-            # still the owner's own event (creator and organizer): say why nothing happens
-            await self._close_with_note(key, "rejected", self._text["changed"], now)
-            self.journal.update(key, reason=problem)
-        else:  # someone else's now (shared, guests, ...): nothing is written into it
-            self.journal.mark(key, "rejected", now, reason=problem)
+        locator = record.get("locator")
+        if event is not None and problem == "edited_after_creation":
+            plan = plan_event_write(event, textutil.block(self._text["changed"]), locator)
+            try:
+                _, locator = await self._run(self.calendar.apply, record["id"], plan)
+            except (ApiError, TransientError) as exc:
+                logger.info("gemini-voice: no note in %s (%s)", key, exc.code)
+        self.journal.mark(key, "rejected", now, reason=problem, locator=locator)
+
+    def _doc_moved(self, doc_id: str, revision: Any) -> bool:
+        return self.docs.get(doc_id).get("revisionId") != revision
 
     async def _unclaim(self, key: str, record: Dict[str, Any], exc: GoogleError, now: datetime) -> None:
         """Google did not answer while the task was being claimed: it goes back to the queue and is retried

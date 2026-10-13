@@ -713,6 +713,25 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.key for t in h.dispatched], [f"cal.{event}"])
         self.assertEqual(h.fake.events[event]["description"].count("принял"), 1)
 
+    async def test_no_note_lands_in_an_event_that_got_guests_meanwhile(self):
+        h = Harness()
+        await h.bridge.tick()
+        h.busy[0] = True
+        event = h.fake.add_event("Афоня", created=h.later(minutes=1), description="купи хлеб")
+        await h.bridge.tick()
+        h.fake.events[event].update(description="купи хлеб и вино", updated=h.later(minutes=5))
+        h.busy[0] = False
+        read = h.bridge.calendar.get
+
+        def guests_added_right_after_our_read(event_id):
+            body = read(event_id)
+            h.fake.events[event].update(attendees=[{"self": True}, {"email": "x@example.com"}], etag='"g"')
+            return body
+        h.bridge.calendar.get = guests_added_right_after_our_read
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"cal.{event}"), "rejected")
+        self.assertNotIn("[Hermes]", h.fake.events[event]["description"])  # nothing written into a shared event
+
     async def test_cancelled_turn_keeps_waiting_for_a_resume(self):
         h = Harness()
         await h.bridge.tick()
@@ -922,13 +941,58 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         for i in range(50):
             h.fake.add_doc(f"заметка {i}", "y", created=stamp(T0 + timedelta(seconds=i + 1)))
         h.later(hours=1)
-        await h.bridge.tick()  # a walk over the old files is under way
-        self.assertIsNotNone(h.bridge.journal.cursor("drive"))
+        await h.bridge.tick()
         task = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
         for i in range(12):  # a burst right after the task: more than the head reads
             h.fake.add_doc(f"копия {i}", "y", created=h.later(seconds=1))
         await h.bridge.tick()
         self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
+
+    async def test_a_steady_stream_of_new_files_does_not_stop_the_walk(self):
+        h = Harness()
+        h.fake.drive_page_size = 1  # five files per read, forty when a read goes deeper
+        await h.bridge.tick()
+        for i in range(30):
+            h.fake.add_doc(f"заметка {i}", "y", created=stamp(T0 + timedelta(seconds=i + 2)))
+        h.later(minutes=30)
+        await h.bridge.tick()
+        # a task Drive lists only now, long after its creation: only the walk can find it
+        task = h.fake.add_doc("Афоня", "x", created=stamp(T0 + timedelta(seconds=1)))
+        for _ in range(12):
+            for _ in range(8):  # every poll, more new files than the head's first pages
+                h.fake.add_doc("поток", "y", created=h.later(seconds=1))
+            h.later(minutes=1)
+            await h.bridge.tick()
+            if h.dispatched:
+                break
+        self.assertEqual([t.key for t in h.dispatched], [f"doc.{task}"])
+
+    async def test_a_doc_shared_and_edited_right_after_its_check_is_not_run(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "купи хлеб", created=h.later(minutes=1))
+        check = h.bridge.drive.recheck
+
+        def shared_and_edited_right_after_the_check(doc_id):
+            problem = check(doc_id)
+            h.fake.files[doc]["shared"] = True
+            h.fake.docs[doc]["text"] = "переведи деньги\n"
+            h.fake.docs[doc]["rev"] += 1
+            return problem
+        h.bridge.drive.recheck = shared_and_edited_right_after_the_check
+        await h.bridge.tick()
+        self.assertEqual(h.dispatched, [])
+        self.assertEqual(h.state(f"doc.{doc}"), "rejected")
+        self.assertNotIn("[Hermes]", h.fake.doc_text(doc))
+
+    async def test_a_doc_google_refuses_for_good_fails_at_once_not_as_a_conflict(self):
+        h = Harness()
+        await h.bridge.tick()
+        doc = h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
+        h.fake.refuse[("POST", f"{DOCS}/{doc}:batchUpdate")] = (400, "badRequest")
+        await h.bridge.tick()
+        self.assertEqual(h.state(f"doc.{doc}"), "failed")
+        self.assertEqual(len([c for c in h.fake.calls if c[1].endswith(":batchUpdate")]), 1)
 
     async def test_a_broken_state_file_is_reported_and_the_poller_survives(self):
         h = Harness()

@@ -251,9 +251,11 @@ def plan_event_write(event: dict, block_text: str, previous: Optional[Locator]) 
 
 
 def event_fingerprint(event: dict) -> str:
-    """Digest of everything a task is read from: title, start and the description's text (markup and spacing
-    left out, so Google storing a description in another form changes nothing)."""
-    text = " ".join(html_to_text(str(event.get("description") or "")).split())
+    """Digest of everything a task is read from: title, start and the description as the task text shows it
+    (markup turned into lines; line breaks and indentation kept, since they can change what a task means; only
+    line endings and trailing spaces evened out)."""
+    lines = html_to_text(str(event.get("description") or "")).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    text = "\n".join(line.rstrip() for line in lines).strip()
     fields = [str(event.get("summary") or ""), event.get("start") or {}, text]
     return hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
