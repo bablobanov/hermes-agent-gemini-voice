@@ -8,9 +8,12 @@
 - The plugin's own OAuth token (`calendar.events.owned`, `drive.metadata.readonly`, `documents`,
   `spreadsheets`), refreshed in memory only; `hermes gemini-voice auth | check | status`
 - Owner-only boundary: invitations, shared files, events added or edited by other people, recurring events and
-  the plugin's own outputs are never tasks; ownership is re-checked right before a task starts, and an event's
-  title, time and description must still be what the plugin first saw (or what its own writes made them); the
-  event acknowledgement is recorded before it is written, so a crash right after it never makes it look foreign
+  the plugin's own outputs are never tasks; ownership is re-checked right before a task starts, on the same
+  version of an event or Doc that the task is read from and the acknowledgement is written onto (a change in
+  between starts the check again; one that keeps changing is retried later); an event's title, time and
+  description must still be what the plugin first saw, what its own writes made them, or a change made within
+  two minutes of creation, else the task is not run and the event gets a note; the event acknowledgement is
+  recorded before it is written, so a crash right after it never makes it look foreign
 - One shared chat, one task at a time (the next starts when the gateway finished the previous turn, and not
   while it resumes turns interrupted by a restart); replies are routed by their anchor, and a reply without one
   goes only to the task interrupted by the restart; a final reply is journaled the moment it arrives; durable
