@@ -146,8 +146,9 @@ schedule (*"every day at 8 send me …"*), Hermes is told to create the cron job
 - **Your text is never deleted.** The plugin replaces only the exact block it wrote itself, where it wrote it
   (in a Doc at the recorded position, in an event only as the very end of the description, in a Sheet in the
   recorded row), never by searching for `[Hermes]`; if anything changed there, the reply is appended instead.
-  In Sheets reply rows are inserted in one atomic update, never written over existing rows. Sheets has no
-  conditional write: an edit to the plugin's own acknowledgement cell in the same second can be overwritten
+  In Sheets reply rows are inserted in one atomic update, never written over existing rows, and the plugin's
+  own acknowledgement cell is replaced only through a server-side exact match: if you edited it, your edit
+  stays and the reply goes below it
 - **Same tools and rules as your other chats.** The plugin adds no approvals of its own and bypasses none.
   A command that needs a person's approval cannot be approved by voice: Hermes waits `approvals.timeout`
   (300 seconds by default) and then refuses it; repeat such a request in your messaging app. `clarify` is
@@ -161,8 +162,9 @@ schedule (*"every day at 8 send me …"*), Hermes is told to create the cron job
   run one at a time: the next starts only when the gateway has finished the previous turn. After a restart
   new tasks wait until the gateway has resumed the interrupted turn; Hermes reports that task in its object
   and asks whether to continue (answer with a new task). A reply without its anchor goes only to that
-  interrupted task, never into another object. If no reply comes within `answer_timeout_minutes`, the object
-  gets a note that the task did not finish
+  interrupted task, never into another object; replies the gateway re-sends after a crash never choose an
+  object (one the plugin already holds is acknowledged, any other is refused). If no reply comes within
+  `answer_timeout_minutes`, the object gets a note that the task did not finish
 - **Digests are never tasks:** documents created by cron delivery carry `[Hermes digest]` in the title and on
   the first line, and events carry a private marker, so an output is never read back as your instruction,
   even if its title contains the label
@@ -184,8 +186,8 @@ hermes gemini-voice check    # token, scopes and the four APIs
 | `api_disabled` | enable the four APIs in the OAuth client's Cloud project |
 
 Limits: one Google account per Hermes profile, one poller per account; one task at a time; recurring events
-are never tasks; no attachments, text only; a sheet is read up to row 500 and column Z (the task says so when
-it is cut) and the reply goes into column A of the first sheet, at most 300 rows; event descriptions are
+are never tasks; no attachments, text only; a sheet is read up to row 500 and column Z (the task always says
+so) and the reply goes into column A of the first sheet, at most 300 rows; event descriptions are
 capped at 7,000 characters of reply; tasks older than `max_age_hours` when their turn comes are skipped with a
 note; at most 30 tasks a day by default.
 

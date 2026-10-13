@@ -14,12 +14,15 @@
   goes only to the task interrupted by the restart; durable journal with at-most-once dispatch across restarts;
   answer timeout with a note in the object; tasks that waited longer than `max_age_hours` are skipped with a note
 - The voice chat takes only final replies: messages from other chats, attachments, approval prompts and replies
-  with no task to go to are refused (final, never retried), never reported as delivered
+  with no task to go to are refused (final, never retried), never reported as delivered; replies the gateway
+  re-sends after a crash never choose an object (one the plugin already holds is acknowledged)
 - Writes replace only the exact block the plugin recorded, at the place it recorded (Doc position, end of the
   event description, Sheet row), and otherwise append; Sheets rows are inserted in one atomic update, never
-  overwritten; replies are written as plain text and as plain-string cell values
+  overwritten, and the acknowledgement cell is swapped only on a server-side exact match; replies are written as
+  plain text and as plain-string cell values
 - Cron delivery targets `gemini_voice:doc` (the title and the first line carry a `[Hermes digest]` signature)
   and `gemini_voice:event-HHMM`; the platform hint tells Hermes to use them for anything scheduled by voice
 - Unattended: a broken token is reported as `retrying / auth_failed` in the gateway status, without a browser
-  flow and without stopping the gateway; one refused or unreachable API does not stop the others or the replies
+  flow and without stopping the gateway; one refused or unreachable API does not stop the others or the replies;
+  listings longer than one poll go on from their page token, so a burst of changes hides nothing
 - Standard library only; unit tests without network, optional contract test against a Hermes checkout
