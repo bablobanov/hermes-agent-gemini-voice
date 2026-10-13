@@ -1,0 +1,173 @@
+# Hermes Agent Gemini Voice
+
+![Hermes Agent Gemini Voice](assets/hero.png)
+
+[English](README.md) · [Русский](README.ru.md) · [安全](SECURITY.md) · [更新日志](CHANGELOG.md)
+
+通过 **Android 手机上的 Gemini 应用**与你的 Hermes Agent 对话：走路时、开车时，无需打开聊天窗口。对 Gemini 说
+*“新建文档：Hermes，比较一下周五飞柏林最便宜的三个航班”*。Hermes 会发现这个文档，用它平常的工具和技能完成任务，
+并把答案写回同一个文档。之后你对 Gemini 说 *“读一下文档 Hermes 航班”*，就能听到结果。
+
+不需要新应用、不需要 Gemini API 密钥、不需要公网端点：通道就是你自己的 Google 日历、文档和表格。Hermes 通过插件
+自己的 Google OAuth 令牌读取它们，Gemini 应用负责朗读。
+
+```text
+Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 / 表格（你的账号）
+                              │ 插件每分钟轮询一次
+                              ▼
+        gemini-voice ──任务──► Hermes 网关（同一个会话，沿用你的工具和规则）
+                              │ 最终回复
+                              ▼
+        回复写回同一个对象 ──► 在 Gemini 中说“读一下文档 …”
+```
+
+## 功能
+
+- **任务输入。** 标题中包含标签词（默认 `Hermes`）的新 Google 日历事件、文档或表格会成为发给 Hermes 的消息。插件
+  先写入 `[Hermes] got it, working on it`，完成后替换为 `[Hermes] reply:` 和答案
+- **摘要输出。** 任何 Hermes 定时任务（cron）都可以投递到新文档（`gemini_voice:doc`）或指定时间的日历事件
+  （`gemini_voice:event-0800`），于是早间简报就变成一句 *“我早上 8 点有什么安排？”*
+- **同一个对话。** 所有语音任务进入同一个会话，就像私聊。Hermes 需要你做决定时会在回复里提问，你再口述一个新任务来回答
+- **只认你自己的对象。** 邀请、别人共享给你的文档、别人加到你日历上的事件一律忽略，即使标题里有标签
+  （见[安全与披露](#安全与披露)）
+
+### Gemini 应用的行为（作者实测，2026 年 10 月）
+
+- 一个任务 = 一个新对象，一句话说完：*“新建文档 Hermes …，内容是 …”*、*“明天 10 点新建事件：Hermes …”*、
+  *“新建表格 Hermes 购物：牛奶、面包、奶酪”*
+- Gemini 不能编辑已有文档，也不能往已有表格里加行，所以对话通过新对象继续
+- Gemini 不会主动通知回复已就绪，需要时你自己去问。日历事件可以用自然的问法：*“我明天 10 点有什么安排？”*
+
+## 前提条件
+
+- Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）
+- 手机上 Gemini 应用所使用的 Google 账号
+- 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，
+  并创建一个类型为 **“桌面应用”（Desktop app）的 OAuth 客户端**
+- 在 OAuth 同意屏幕上点击 **Publish app**（状态为 “In production”）。若保持 “Testing” 状态，Google 会在 7 天后使
+  刷新令牌失效，通道会在一周后静默停止工作。仅供自己账号使用时，未经验证的应用也可以，授权时会看到一次 Google 的
+  “未验证应用”提示
+
+## 安装
+
+1. 安装并启用插件（从插件目录安装，或克隆本仓库并把 `plugins/gemini-voice` 复制到 Hermes 插件目录）：
+
+   ```sh
+   hermes plugins install gemini-voice
+   hermes plugins enable gemini-voice
+   ```
+
+2. 在 Hermes 主机的终端里为插件授权一次 Google 访问。准备好 OAuth 客户端 JSON 文件，或在提示时粘贴客户端 ID 和密钥：
+
+   ```sh
+   hermes gemini-voice auth --client-secret-file <PATH_TO_CLIENT_JSON>
+   ```
+
+   命令会输出一个 Google 授权链接。用登录了手机上那个 Google 账号的浏览器打开它，允许全部四项权限，然后复制无法打开的
+   页面地址（`http://localhost:1/…`）并粘贴回来。命令会把 `GEMINI_VOICE_CLIENT_ID`、`GEMINI_VOICE_CLIENT_SECRET` 和
+   `GEMINI_VOICE_REFRESH_TOKEN` 写入 Hermes 的 `.env`，不会打印任何密钥。
+
+3. 检查并用你平常的方式重启网关：
+
+   ```sh
+   hermes gemini-voice check
+   ```
+
+   预期输出：`TOKEN_OK scopes: calendar.events.owned drive.metadata.readonly documents spreadsheets`，且 Calendar、
+   Drive、Docs、Sheets 四个 API 都显示 `OK`。
+
+4. `config.yaml` 中的可选设置（以下为默认值）：
+
+   ```yaml
+   plugins:
+     entries:
+       gemini-voice:
+         settings:
+           labels: [Hermes]          # "Herm*" 匹配任何以 "Herm" 开头的词
+           language: en              # en | ru，插件自身状态行的语言
+           timezone: UTC             # IANA 时区名，用于状态时间和 event-HHMM 投递
+           poll_seconds: 60
+           max_age_hours: 24         # 更早创建的对象永远不会当作任务
+           answer_timeout_minutes: 40
+           max_tasks_per_day: 30
+           sources: [calendar, docs, sheets]
+   ```
+
+   语音任务使用该平台的工具集，配置方式与其他平台相同（`platform_toolsets.gemini_voice`，默认
+   `hermes-gemini_voice`）。如果希望语音拥有与主聊天相同的能力，就给它配置相同的工具。
+
+## 使用
+
+| 对 Gemini 说 | 结果 |
+|---|---|
+| “新建文档：Hermes，帮我起草一封给房东的暖气问题回复” | Hermes 把草稿写进该文档 |
+| “明天 9 点新建事件：Hermes，去护照办公室要带什么” | 答案写进事件描述 |
+| “新建表格 Hermes 开销：油费 3000” | Hermes 处理后在下面几行回复 |
+| “读一下文档 Hermes 房东” / “我明天 9 点有什么安排？” | Gemini 朗读回复 |
+| “新建文档：Hermes，可以，发出去吧” | 回答 Hermes 在上一条回复中提出的问题 |
+
+把定时任务的输出投递到适合语音收听的目标：
+
+```sh
+hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
+  --name "Briefing" --deliver gemini_voice:event-0800 --failure-deliver local
+```
+
+`gemini_voice:doc` 会新建一个文档，标题取输出的第一行。`gemini_voice:event-HHMM` 会在该本地时间新建一个 15 分钟的
+事件（同一天再次投递时更新它）。
+
+## 安全与披露
+
+- **网络：** 只访问 Google API（Calendar、Drive、Docs、Sheets）和 `oauth2.googleapis.com`，每次轮询和每个任务各一次。
+  没有遥测，不访问其他主机
+- **凭据：** 插件只使用三个 `GEMINI_VOICE_*` 变量中它自己的 OAuth 客户端和刷新令牌，从不读取其他工具的令牌文件。访问
+  令牌只保存在内存中；唯一写入凭据的地方是由你运行的 `hermes gemini-voice auth`，并通过 Hermes 自带的 `.env` 写入函数完成
+- **Google 权限范围：** `calendar.events.owned`、`drive.metadata.readonly`、`documents`、`spreadsheets`。没有 Gmail，
+  没有完整的 Drive 访问权。插件读取文件元数据以发现新对象，读取带标签对象的文本，只写入任务对象以及它的定时投递所创建的对象
+- **谁能下达任务：** 能在这个 Google 账号里创建对象的人，通常就是拿着装有 Gemini 应用的你的手机的人。只有账号所有者本人
+  创建的对象才算数：日历事件必须由所有者创建并组织且没有其他宾客；文档和表格必须归你所有、未共享且最后由你修改。正因如此，
+  该平台注册为 `trusted_inbound`：事件来自你授权的 Google 账号，而不是来自其他人
+- **与其他聊天相同的工具和规则。** 插件不增加自己的审批，也不绕过任何审批。需要人工批准的命令无法通过语音批准，因此 Hermes
+  在此通道上会拒绝它们；请在你的消息应用中重新发出这类请求。`clarify` 在此平台被禁用，因为回合进行中没人能回答
+- **后台工作：** 平台连接期间，网关进程内有一个轮询任务
+- **至多一次：** 每个对象在交给网关之前都会先记录；重启后任务绝不会再次启动。Hermes 会自行完成被中断的回合，或者在
+  `answer_timeout_minutes` 之后在对象里写明任务未完成
+- **无人值守：** 令牌被撤销或过期时绝不会打开浏览器授权流程。平台会在网关状态中报告 `retrying / auth_failed`
+  （`gateway_state.json`、`hermes gateway status`），记录一行日志，每 15 分钟重新检查一次，网关照常运行
+
+## 状态与排障
+
+```sh
+hermes gemini-voice status   # 平台状态、上次成功轮询时间、任务计数（不含标题和正文）
+hermes gemini-voice check    # 令牌、权限范围和四个 API
+```
+
+| 状态码 | 含义与处理 |
+|---|---|
+| `auth_failed` | 令牌被撤销、过期或缺少权限：运行 `hermes gemini-voice auth`，然后重启网关 |
+| `google_unreachable` | 网络或 Google 故障：以最长 15 分钟的退避间隔重试 |
+| `api_disabled` | 在 OAuth 客户端所属的 Cloud 项目中启用这四个 API |
+
+限制：每个 Hermes 配置档对应一个 Google 账号，每个账号一个轮询器；表格回复写入第一个工作表的 A 列；日历事件描述中的回复
+最多 7,000 个字符；默认每天最多 30 个任务。
+
+## 测试
+
+```sh
+python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -v
+```
+
+单元测试不需要网络，也不需要 Hermes，使用内存中的 Google 模拟。可选的引擎契约测试会通过真实的 Hermes 检出加载插件，
+没有检出时跳过（跳过不等于通过）：
+
+```sh
+GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
+  python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -p test_engine_contract.py -v
+```
+
+## 项目
+
+- `plugins/gemini-voice/`：插件本体（仅用标准库，无 Python 依赖）及其测试
+- [更新日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全](SECURITY.md) · [MIT 许可证](LICENSE)
+
+MIT © 2026 Ilya Balobanov。独立集成，并非 Google 或 Nous Research 的官方产品。Gemini 和 Google 是 Google LLC 的商标。
