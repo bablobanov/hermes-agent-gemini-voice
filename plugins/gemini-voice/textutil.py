@@ -6,10 +6,14 @@ import re
 from datetime import datetime
 from typing import Iterable, List, Optional
 
-# Every block this plugin writes starts with a line beginning with MARKER. Speech recognition never
-# produces square brackets, so a dictated task cannot contain it, and Gemini reads it simply as "Hermes".
-# The block is always the last part of the text; the LAST marker line is where it starts.
+# Every block this plugin writes into a task object starts with MARKER; Gemini reads it as "Hermes".
+# The marker is cosmetic: the plugin finds its own block by the exact text it recorded when writing,
+# never by searching for the marker, so a marker in the owner's text or in a reply deletes nothing.
 MARKER = "[Hermes]"
+# First line of every document the cron output channel creates. It is checked again when a document
+# is read as a task, so an output can never come back in as an owner task, even without the journal.
+OUTPUT_MARKER = "[Hermes digest]"
+_MARKER_FORGERY = re.compile(r"\[+\s*[*_`~]*\s*hermes(\s+digest)?\s*[*_`~]*\s*\]+", re.IGNORECASE)
 
 STRINGS = {
     "en": {
@@ -19,6 +23,7 @@ STRINGS = {
         "failed": "the task failed ({reason}). Dictate it again if it is still needed",
         "done_silent": "done, no text reply ({time})",
         "daily_cap": "daily task limit reached ({limit}); this task was not run",
+        "stale": "this task waited too long and was not run. Dictate it again if it is still needed",
         "truncated": "(reply shortened)",
     },
     "ru": {
@@ -28,6 +33,7 @@ STRINGS = {
         "failed": "не получилось выполнить ({reason}). Повторите, если ещё нужно",
         "done_silent": "готово, текстового ответа нет ({time})",
         "daily_cap": "дневной лимит поручений исчерпан ({limit}), это поручение не выполнялось",
+        "stale": "поручение слишком долго ждало очереди и не выполнялось. Повторите, если ещё нужно",
         "truncated": "(ответ сокращён)",
     },
 }
@@ -72,22 +78,20 @@ def has_label(title: Optional[str], patterns: List[re.Pattern]) -> bool:
     return any(p.search(text) for p in patterns)
 
 
-def is_marker_line(line: Optional[str]) -> bool:
-    """True for the first line of a block written by this plugin."""
-    return (line or "").lstrip().startswith(MARKER)
+def is_output(text: Optional[str]) -> bool:
+    """True when a document's text carries the output-channel signature (its first non-empty line)."""
+    for line in (text or "").split("\n"):
+        if line.strip():
+            return line.strip().startswith(OUTPUT_MARKER)
+    return False
 
 
-def has_tag(text: Optional[str]) -> bool:
-    """True when the text already contains a block written by this plugin."""
-    return any(is_marker_line(line) for line in (text or "").split("\n"))
-
-
-def cut_block(text: Optional[str]) -> str:
-    """Owner text with our trailing block (from the last marker line on) removed."""
-    lines = (text or "").split("\n")
-    starts = [i for i, line in enumerate(lines) if is_marker_line(line)]
-    kept = lines[:starts[-1]] if starts else lines
-    return "\n".join(kept).rstrip()
+def remove_suffix_block(text: str, block_text: Optional[str]) -> str:
+    """``text`` without the exact block this plugin last wrote, when that block is still there."""
+    if not block_text:
+        return text
+    at = text.rfind(block_text)
+    return text if at < 0 else (text[:at] + text[at + len(block_text):])
 
 
 def block(header: str, body: str = "") -> str:
@@ -96,12 +100,20 @@ def block(header: str, body: str = "") -> str:
     return head if not body.strip() else head + "\n" + body.strip()
 
 
+def _unforge(text: str) -> str:
+    previous = None
+    while previous != text:  # repeat: removing one layer of markup can reveal another
+        previous = text
+        text = _MARKER_FORGERY.sub("Hermes", text)
+    return text
+
+
 def plain_text(content: Optional[str]) -> str:
-    """Markdown rendered as plain text for a speech reader; the agent's text can never fake our marker."""
-    text = (content or "").replace("\r\n", "\n").replace(MARKER, "Hermes")
+    """Markdown rendered as plain text for a speech reader; our markers cannot be forged by the agent."""
+    text = _unforge((content or "").replace("\r\n", "\n"))
     for pattern, repl in _MARKDOWN_SUBS:
         text = pattern.sub(repl, text)
-    return text.strip()
+    return _unforge(text).strip()
 
 
 def truncate(text: str, limit: int, note: str) -> str:

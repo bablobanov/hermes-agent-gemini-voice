@@ -43,6 +43,7 @@ class FakeGoogle:
         self.revoked = False
         self.offline = False
         self.fail_writes = False
+        self.refuse: Dict[Tuple[str, str], Tuple[int, str]] = {}  # (method, url) -> (status, reason)
         self.reject_access_once = False
         self.token_scope = ALL_SCOPES
         self.refreshes = 0
@@ -57,15 +58,18 @@ class FakeGoogle:
 
     def add_event(self, summary: str, *, created: str, self_creator: bool = True, self_organizer: bool = True,
                   description: str = "", attendees: Optional[List[dict]] = None, event_type: str = "default",
-                  status: str = "confirmed", private: Optional[Dict[str, str]] = None) -> str:
+                  status: str = "confirmed", private: Optional[Dict[str, str]] = None,
+                  updated: Optional[str] = None, recurrence: Optional[List[str]] = None) -> str:
         event_id = self._next("ev")
         self._etag += 1
-        event = {"id": event_id, "summary": summary, "created": created, "updated": created, "status": status,
+        event = {"id": event_id, "summary": summary, "created": created, "updated": updated or created, "status": status,
                  "eventType": event_type, "description": description, "etag": f'"{self._etag}"',
                  "creator": {"self": self_creator}, "organizer": {"self": self_organizer},
                  "start": {"dateTime": "2026-10-14T10:00:00+05:00"}}
         if attendees:
             event["attendees"] = attendees
+        if recurrence:
+            event["recurrence"] = list(recurrence)
         if private:
             event["extendedProperties"] = {"private": dict(private)}
         self.events[event_id] = event
@@ -112,6 +116,9 @@ class FakeGoogle:
             return _error(401, "authError")
         if self.fail_writes and method != "GET":
             return _error(503, "backendError")
+        if (method, base) in self.refuse:
+            status, reason = self.refuse[(method, base)]
+            return _error(status, reason)
         return self._route(method, base, params, payload, headers)
 
     def _token(self, form: Dict[str, str]) -> Reply:
@@ -124,9 +131,10 @@ class FakeGoogle:
         routes: List[Tuple[str, str, Callable[..., Reply]]] = [
             ("GET", CAL, self._cal_list), ("POST", CAL, self._cal_insert),
             ("GET", CAL + "/", self._cal_get), ("PATCH", CAL + "/", self._cal_patch),
-            ("GET", DRIVE, self._drive_list), ("POST", DOCS, self._doc_create),
+            ("GET", DRIVE, self._drive_list), ("GET", DRIVE + "/", self._drive_get),
+            ("POST", DOCS, self._doc_create),
             ("GET", DOCS + "/", self._doc_get), ("POST", DOCS + "/", self._doc_batch),
-            ("GET", SHEETS + "/", self._sheet_get), ("POST", SHEETS + "/", self._sheet_clear),
+            ("GET", SHEETS + "/", self._sheet_get), ("POST", SHEETS + "/", self._sheet_post),
             ("PUT", SHEETS + "/", self._sheet_update),
         ]
         for verb, prefix, handler in routes:
@@ -158,6 +166,7 @@ class FakeGoogle:
         event.update(payload or {})
         self._etag += 1
         event["etag"] = f'"{self._etag}"'
+        event["updated"] = "2099-01-01T00:00:00Z"  # Google moves `updated` on every change
         return _json(200, event)
 
     def _cal_insert(self, _tail: str, _p: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
@@ -171,6 +180,10 @@ class FakeGoogle:
     # ------------------------------------------------------------------ drive
     def _drive_list(self, _tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
         return _json(200, {"files": list(self.files.values())})
+
+    def _drive_get(self, tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
+        item = self.files.get(urllib.parse.unquote(tail))
+        return _json(200, item) if item else _error(404, "notFound")
 
     # ------------------------------------------------------------------ docs
     def _doc_body(self, doc_id: str) -> Dict[str, Any]:
@@ -225,14 +238,35 @@ class FakeGoogle:
         if sheet_id not in self.sheets:
             return _error(404, "notFound")
         if not rest:
-            return _json(200, {"sheets": [{"properties": {"sheetId": 0, "title": "Sheet 1", "index": 0}}]})
-        return _json(200, {"values": [r for r in self.sheets[sheet_id]]})
+            return _json(200, {"sheets": [{"properties": {"sheetId": 7, "title": "Sheet 1", "index": 0}}]})
+        rng = urllib.parse.unquote(rest.split("values/", 1)[1]).split("!")[-1]
+        rows = self.sheets[sheet_id]
+        if ":" in rng:  # the plugin reads A1:Z500
+            return _json(200, {"values": [r for r in rows[:500]]})
+        row = self._start_row(rng)
+        cell = rows[row - 1][:1] if row - 1 < len(rows) and rows[row - 1] else []
+        return _json(200, {"values": [cell]} if cell else {})
 
-    def _sheet_clear(self, tail: str, _p: Dict[str, str], _payload: Any, _h: Dict[str, str]) -> Reply:
+    def _sheet_post(self, tail: str, params: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
+        if tail.endswith(":batchUpdate"):
+            sheet_id = urllib.parse.unquote(tail).split(":")[0]
+            for request in (payload or {}).get("requests") or []:
+                rng = request["insertDimension"]["range"]
+                assert rng["sheetId"] == 7 and rng["dimension"] == "ROWS", request
+                for _ in range(rng["endIndex"] - rng["startIndex"]):
+                    self.sheets[sheet_id].insert(rng["startIndex"], [])
+            return _json(200, {})
         sheet_id, _, rest = tail.partition("/values/")
-        start = self._start_row(rest.rsplit(":clear", 1)[0])
-        self.sheets[sheet_id] = self.sheets[sheet_id][:start - 1]
-        return _json(200, {})
+        assert rest.endswith(":append"), tail
+        self.sheet_writes.append({"valueInputOption": params.get("valueInputOption"),
+                                  "insertDataOption": params.get("insertDataOption"), "body": payload})
+        rows = self.sheets[sheet_id]
+        while rows and not rows[-1]:
+            rows.pop()
+        start = len(rows) + 1
+        rows.extend(list(r) for r in (payload or {}).get("values") or [])
+        end = len(rows)
+        return _json(200, {"updates": {"updatedRange": f"'Sheet 1'!A{start}:A{end}"}})
 
     def _sheet_update(self, tail: str, params: Dict[str, str], payload: Any, _h: Dict[str, str]) -> Reply:
         sheet_id, _, rest = tail.partition("/values/")

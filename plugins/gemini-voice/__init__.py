@@ -9,7 +9,8 @@ import os
 from typing import Any, Dict, Optional
 
 from .auth_cli import ENV_NAMES, default_io, handle, setup_parser
-from .bridge import PLATFORM, Settings, Task, VoiceBridge
+from .bridge import OWNER_CHAT, PLATFORM, Settings, Task, VoiceBridge
+from .journal import NullStore
 
 logger = logging.getLogger("gemini_voice")
 
@@ -59,6 +60,9 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     if not _is_connected():
         return None
     home = (_read_secret(HOME_CHANNEL_ENV) or "doc").strip()
+    if home == OWNER_CHAT:
+        logger.warning("gemini-voice: %s=owner is not a delivery target; using doc", HOME_CHANNEL_ENV)
+        home = "doc"
     return {"home_channel": {"chat_id": home, "name": "Google (new document)" if home == "doc" else f"Google {home}"}}
 
 
@@ -88,7 +92,8 @@ def register(ctx: Any) -> None:
         return GeminiVoiceAdapter(config, settings=settings(), store=ctx.state, read_secret=_read_secret)
 
     async def standalone_send(pconfig: Any, chat_id: str, message: str, **_: Any) -> Dict[str, Any]:
-        """Cron delivery when no gateway runs in this process."""
+        """Cron delivery when no gateway runs in this process. It never touches the gateway's journal
+        (NullStore): output documents are recognised by their signature line, not by the journal."""
         from .google_api import GoogleClient, TokenSource
         credentials = [_read_secret(name) or "" for name in ENV_NAMES]
         if not all(credentials):
@@ -97,7 +102,7 @@ def register(ctx: Any) -> None:
         async def _no_dispatch(_task: Task) -> None:
             raise RuntimeError("standalone delivery cannot start tasks")
 
-        bridge = VoiceBridge(settings(), GoogleClient(TokenSource(*credentials)), ctx.state,
+        bridge = VoiceBridge(settings(), GoogleClient(TokenSource(*credentials)), NullStore(),
                              _no_dispatch, lambda *_args: None)
         ok, ref = await bridge.deliver_output(str(chat_id), message)
         return {"success": True, "message_id": ref} if ok else {"error": ref}

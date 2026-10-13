@@ -122,8 +122,9 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
   --name "Briefing" --deliver gemini_voice:event-0800 --failure-deliver local
 ```
 
-`gemini_voice:doc` creates a new document titled with the first line of the output.
-`gemini_voice:event-HHMM` creates (or updates, on the same day) a 15-minute event at that local time.
+`gemini_voice:doc` creates a new document titled with the first line of the output; its text starts with
+`[Hermes digest] <title>`. `gemini_voice:event-HHMM` creates (or updates, on the same day) a 15-minute event
+at that local time. The voice chat itself is not a delivery target.
 
 ## Safety and disclosure
 
@@ -136,18 +137,26 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
   no full Drive access. The plugin reads file metadata to find new objects, reads the text of labelled
   objects, and writes only into task objects and the objects its cron delivery creates
 - **Who can give tasks:** whoever can create objects in this Google account, which normally means whoever
-  has your phone with the Gemini app. Only objects the account owner created count: for events the owner
-  must be the creator and the organizer with no other guests; for Docs and Sheets the file must be owned by
-  you, not shared, and last modified by you. The platform is registered as `trusted_inbound` for that reason:
-  events come from the Google account you authorized, not from other people
+  has your phone with the Gemini app. Only objects the account owner created count: an event must be a
+  one-off event the owner created and organizes with no other guests, not edited later by anyone; a Doc or
+  Sheet must be owned by you, not shared, and last modified by you. Ownership is checked again right before
+  a task starts. The platform is registered as `trusted_inbound` for that reason: events come from the
+  Google account you authorized, not from other people
+- **Your text is never deleted.** The plugin replaces only the exact block it wrote itself (found by the
+  text it recorded, not by searching for `[Hermes]`); if anything changed around it, the reply is appended
+  instead. In Sheets reply rows are inserted, never written over existing rows
 - **Same tools and rules as your other chats.** The plugin adds no approvals of its own and bypasses none.
-  Commands that need a person's approval cannot be approved by voice, so Hermes refuses them on this channel;
-  repeat such a request in your messaging app. `clarify` is blocked on this platform because nobody can answer
-  in the middle of a turn
+  A command that needs a person's approval cannot be approved by voice: Hermes waits `approvals.timeout`
+  (300 seconds by default) and then refuses it; repeat such a request in your messaging app. `clarify` is
+  blocked on this platform because nobody can answer in the middle of a turn
 - **Background work:** a polling task inside the gateway process while the platform is connected
-- **At most once:** every object is recorded before it is handed over; after a restart a task is never
-  started again. Hermes finishes an interrupted turn itself, or after `answer_timeout_minutes` the object gets
-  a note that the task did not finish
+- **At most once:** every object is recorded before it is handed over and is never handed over again. Tasks
+  run one at a time: the next starts only when the gateway has finished the previous turn. After a restart
+  Hermes reports the interrupted task in its object and asks whether to continue (answer with a new task);
+  if no reply comes within `answer_timeout_minutes`, the object gets a note that the task did not finish
+- **Digests are never tasks:** documents created by cron delivery start with a `[Hermes digest]` line and
+  events carry a private marker, so an output is never read back as your instruction, even if its title
+  contains the label
 - **Unattended:** a revoked or expired token never opens a browser flow. The platform reports
   `retrying / auth_failed` in the gateway status (`gateway_state.json`, `hermes gateway status`), logs one
   line, re-checks every 15 minutes, and the gateway keeps running
@@ -165,8 +174,10 @@ hermes gemini-voice check    # token, scopes and the four APIs
 | `google_unreachable` | network or Google outage: retried with backoff up to 15 minutes |
 | `api_disabled` | enable the four APIs in the OAuth client's Cloud project |
 
-Limits: one Google account per Hermes profile, one poller per account; the reply goes into column A of the
-first sheet; event descriptions are capped at 7,000 characters of reply; at most 30 tasks a day by default.
+Limits: one Google account per Hermes profile, one poller per account; one task at a time; recurring events
+are never tasks; the reply goes into column A of the first sheet; event descriptions are capped at 7,000
+characters of reply; tasks older than `max_age_hours` when their turn comes are skipped with a note; at most
+30 tasks a day by default.
 
 ## Tests
 

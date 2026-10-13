@@ -4,11 +4,14 @@
                  |            |-> abandoned (no answer within the timeout)
                  |            |-> failed (the turn errored)
                  |-> failed (could not read or acknowledge it)
-    queued -> skipped (daily limit)
+    queued -> skipped (daily limit, waited too long, or it is the plugin's own output)
+    queued -> rejected (ownership no longer holds when the task is about to start; nothing is written)
 
 ``dispatched`` is written to disk *before* the task is handed to the gateway, and a dispatched task is
-never handed over again. A restart therefore cannot run a task twice: the gateway either finishes the
-interrupted turn itself, or the task is closed as ``abandoned`` with a note in the object.
+never handed over again. A restart therefore cannot start a task twice: the gateway resumes the
+interrupted turn in the same chat, or the task is closed as ``abandoned`` with a note in the object.
+
+One process owns the journal: the gateway's poller. Out-of-process cron delivery uses ``NullStore``.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 STORE_KEY = "journal"
 VERSION = 1
-FINAL_STATES = {"done", "abandoned", "failed", "skipped"}
+FINAL_STATES = {"done", "abandoned", "failed", "skipped", "rejected"}
 KEEP_DAYS = 30
 
 
@@ -26,6 +29,16 @@ class Store(Protocol):
     def get(self, key: str, default: Any = None) -> Any: ...
 
     def set(self, key: str, value: Any) -> None: ...
+
+
+class NullStore:
+    """A store that keeps nothing: for delivery outside the gateway, which must not touch the journal."""
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return default
+
+    def set(self, key: str, value: Any) -> None:
+        return None
 
 
 def iso(moment: Optional[datetime]) -> Optional[str]:
@@ -70,8 +83,10 @@ class Journal:
     def calendar_updated_min(self, default: datetime) -> datetime:
         return from_iso(self.data.get("cal_updated_min")) or default
 
-    def poll_ok(self, now: datetime, calendar_mark: datetime) -> None:
-        self.data["last_poll_ok"] = iso(now)
+    def poll_ok(self, now: Optional[datetime], calendar_mark: datetime) -> None:
+        """Record a finished poll: ``now`` only when every source answered; the calendar watermark."""
+        if now is not None:
+            self.data["last_poll_ok"] = iso(now)
         self.data["cal_updated_min"] = iso(calendar_mark)
         self.save()
 

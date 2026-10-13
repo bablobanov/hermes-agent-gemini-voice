@@ -22,7 +22,7 @@ def install(plugin_dir: Path, home: Path) -> None:
 
 class StubBridge:
     def __init__(self):
-        self.answers, self.outputs = [], []
+        self.answers, self.outputs, self.completed = [], [], []
 
     async def deliver_answer(self, reply_to, content):
         self.answers.append((reply_to, content))
@@ -31,6 +31,30 @@ class StubBridge:
     async def deliver_output(self, target, content):
         self.outputs.append((target, content))
         return True, "doc.stub"
+
+    async def on_turn_complete(self, message_id, outcome, streamed=""):
+        self.completed.append((message_id, outcome))
+
+
+async def full_turn(adapter, stub, task_cls) -> dict:
+    """A real gateway admission and background turn on the adapter, with a stand-in message handler."""
+    seen = {}
+
+    async def handler(event):
+        seen["text"] = event.text
+        seen["busy_during_turn"] = adapter._owner_session_busy()
+        seen["control"] = event.allow_gateway_control
+        return "final **answer**"
+
+    adapter.set_message_handler(handler)
+    await adapter._dispatch(task_cls("doc.turn1", "doc", "t", "the task text"))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if stub.completed:
+            break
+    await asyncio.sleep(0.05)
+    seen["busy_after_turn"] = adapter._owner_session_busy()
+    return seen
 
 
 def probe() -> dict:
@@ -68,12 +92,32 @@ def probe() -> dict:
     adapter._bridge = stub
     final = asyncio.run(adapter.send("owner", "final", reply_to="doc.x", metadata={"notify": True}))
     progress = asyncio.run(adapter.send("owner", "progress", metadata={"_interim_send": True}))
+    after_progress = (len(stub.answers), len(stub.outputs))
     approval = asyncio.run(adapter.send("owner", "approve?", metadata={"is_approval_prompt": True}))
     output = asyncio.run(adapter.send("event-0800", "digest", metadata={"notify": True, "job_id": "j"}))
-    results["final reply routed"] = [final.success and stub.answers == [("doc.x", "final")], repr(stub.answers)]
-    results["progress dropped"] = [progress.success and len(stub.answers) == 1, ""]
+    to_owner = asyncio.run(adapter.send("owner", "digest", metadata={"notify": True, "job_id": "j"}))
+    from gateway.delivery_ledger import RECOVERED_MARKER
+    asyncio.run(adapter.send("owner", RECOVERED_MARKER + "lost final reply"))
+    results["final reply routed"] = [final.success and stub.answers[0] == ("doc.x", "final"), repr(stub.answers)]
+    results["progress dropped"] = [progress.success and after_progress == (1, 0), repr(after_progress)]
     results["approval refused"] = [approval.success is False, str(approval.error)]
     results["cron output routed"] = [output.success and stub.outputs == [("event-0800", "digest")], repr(stub.outputs)]
+    results["cron to voice chat refused"] = [to_owner.success is False, str(to_owner.error)]
+    results["recovered reply routed"] = [stub.answers[-1] == (None, "lost final reply"), repr(stub.answers[-1])]
+    results["interactive resume"] = [type(adapter).interactive_resume is True, ""]
+
+    from importlib import import_module
+    bridge_module = import_module(type(adapter).__module__.rsplit(".", 1)[0] + ".bridge")
+    turn_stub = StubBridge()
+    adapter._bridge = turn_stub
+    seen = asyncio.run(full_turn(adapter, turn_stub, bridge_module.Task))
+    results["gateway accepted the task"] = [seen.get("text") == "the task text", repr(seen.get("text"))]
+    results["no gateway control from voice"] = [seen.get("control") is False, repr(seen.get("control"))]
+    results["session busy during turn"] = [seen.get("busy_during_turn") is True, repr(seen.get("busy_during_turn"))]
+    results["session free after turn"] = [seen.get("busy_after_turn") is False, repr(seen.get("busy_after_turn"))]
+    results["real final send has notify and anchor"] = [
+        bool(turn_stub.answers) and turn_stub.answers[0][0] == "doc.turn1", repr(turn_stub.answers)]
+    results["turn completion reported"] = [turn_stub.completed == [("doc.turn1", "success")], repr(turn_stub.completed)]
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

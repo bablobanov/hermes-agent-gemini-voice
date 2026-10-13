@@ -16,22 +16,22 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from . import textutil
 from .google_api import ApiError, AuthError, GoogleClient, GoogleError, TransientError
 from .journal import Journal, Store, from_iso
-from .sources import Calendar, CalendarOutput, Docs, Drive, Sheets, Verdict
+from .sources import Calendar, CalendarOutput, Docs, Drive, Locator, Sheets, Verdict
 
 logger = logging.getLogger("gemini_voice")
 
 PLATFORM = "gemini_voice"
 OWNER_CHAT = "owner"
 SOURCES = ("calendar", "docs", "sheets")
-FOREIGN_REASONS = {"not_creator", "not_organizer", "has_attendees", "event_type",
-                   "not_owned", "shared", "modified_by_other"}
+FOREIGN_REASONS = {"not_creator", "not_organizer", "has_attendees", "event_type", "recurring",
+                   "edited_after_creation", "not_owned", "shared", "modified_by_other"}
 TASK_TEXT_LIMIT = 8000
 ANSWER_LIMITS = {"cal": 7000, "doc": 30000, "sheet": 30000}
 KIND_NAMES = {"cal": "Google Calendar event", "doc": "Google Doc", "sheet": "Google Sheet"}
 AUTH_RECHECK = timedelta(minutes=15)
 CALENDAR_SKEW = timedelta(minutes=10)
-TURN_GRACE = timedelta(minutes=2)
 MAX_BACKOFF = 900.0
+MAX_LOGGED_REJECTS = 1000
 _SLOT = re.compile(r"^event-([01]\d|2[0-3])([0-5]\d)$")
 
 
@@ -115,18 +115,20 @@ class VoiceBridge:
 
     def __init__(self, settings: Settings, client: GoogleClient, store: Store, dispatch: Dispatch,
                  publish_status: PublishStatus, *, clock: Optional[Callable[[], datetime]] = None,
-                 run_blocking: Optional[Callable[..., Awaitable[Any]]] = None):
+                 run_blocking: Optional[Callable[..., Awaitable[Any]]] = None,
+                 session_busy: Callable[[], bool] = lambda: False):
         self.settings = settings
         self.journal = Journal(store)
         self.calendar, self.drive = Calendar(client), Drive(client)
         self.docs, self.sheets, self.calendar_output = Docs(client), Sheets(client), CalendarOutput(client)
-        self._dispatch, self._publish = dispatch, publish_status
+        self._dispatch, self._publish, self._session_busy = dispatch, publish_status, session_busy
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._run = run_blocking or asyncio.to_thread
         self._patterns = textutil.compile_labels(settings.labels)
         self._text = textutil.strings(settings.language)
         self._zone, self._zone_name = resolve_zone(settings.timezone)
         self._lock = asyncio.Lock()
+        self._recovered = False
         self._auth_failed_at: Optional[datetime] = None
         self._backoff = 0.0
         self._status: Optional[Tuple[str, str]] = None
@@ -134,14 +136,15 @@ class VoiceBridge:
 
     # ------------------------------------------------------------------------------------ loop
     async def run_forever(self) -> None:
-        self.recover(self._clock())
         while True:
             try:
                 delay = await self.tick()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:  # e.g. the state file cannot be written: say so in the status, keep going
                 logger.exception("gemini-voice: poll cycle failed")
+                self._set_status("retrying", "internal_error",
+                                 f"poll cycle failed ({type(exc).__name__}); see the gateway log")
                 delay = float(self.settings.poll_seconds * 2)
             await asyncio.sleep(delay)
 
@@ -158,32 +161,48 @@ class VoiceBridge:
             return float(self.settings.poll_seconds)
         try:
             async with self._lock:
-                await self._poll(now)
-                self._on_success()
+                if not self._recovered:
+                    self.recover(now)
+                    self._recovered = True
+                problems = await self._poll(now)
+                self._on_success(problems)
                 await self._advance(now)
         except AuthError as exc:
             return self._on_auth_error(exc, now)
         except TransientError as exc:
             return self._on_transient(exc)
         except ApiError as exc:
-            return self._on_api_error(exc)
+            self._on_success([exc])
         return float(self.settings.poll_seconds)
 
     # ---------------------------------------------------------------------------------- polling
-    async def _poll(self, now: datetime) -> None:
+    async def _poll(self, now: datetime) -> List[ApiError]:
+        """List candidates from every source; one refused API does not stop the others."""
         since = self.journal.since(now)
         not_before = max(since, now - timedelta(hours=self.settings.max_age_hours))
+        calendar_mark = self.journal.calendar_updated_min(not_before)
         verdicts: List[Verdict] = []
+        problems: List[ApiError] = []
         if "calendar" in self.settings.sources:
-            updated_min = max(not_before, self.journal.calendar_updated_min(not_before) - CALENDAR_SKEW)
-            verdicts += await self._run(self.calendar.candidates, self._patterns, not_before, updated_min)
+            try:
+                found, complete = await self._run(self.calendar.candidates, self._patterns, not_before,
+                                                  max(not_before, calendar_mark - CALENDAR_SKEW))
+                verdicts += found
+                calendar_mark = now if complete else calendar_mark  # a cut listing is read again
+            except ApiError as exc:
+                problems.append(exc)
         kinds = [k for k, s in (("doc", "docs"), ("sheet", "sheets")) if s in self.settings.sources]
         if kinds:
-            verdicts += await self._run(self.drive.candidates, self._patterns, not_before, kinds,
-                                        self.journal.outbound_ids())
+            try:
+                found, _ = await self._run(self.drive.candidates, self._patterns, not_before, kinds,
+                                           self.journal.outbound_ids())
+                verdicts += found
+            except ApiError as exc:
+                problems.append(exc)
         for verdict in verdicts:
             self._consider(verdict, now)
-        self.journal.poll_ok(now, now)
+        self.journal.poll_ok(now if not problems else None, calendar_mark)
+        return problems
 
     def _consider(self, verdict: Verdict, now: datetime) -> None:
         obj = verdict.obj
@@ -195,13 +214,16 @@ class VoiceBridge:
             return
         if verdict.reason in FOREIGN_REASONS and textutil.has_label(obj.title, self._patterns):
             if obj.key not in self._logged_rejects:
+                if len(self._logged_rejects) >= MAX_LOGGED_REJECTS:
+                    self._logged_rejects.clear()
                 self._logged_rejects.add(obj.key)
-                logger.info("gemini-voice: ignored %s (%s): not created by the account owner",
+                logger.info("gemini-voice: ignored %s (%s): not a task from the account owner",
                             obj.key, verdict.reason)
 
     # --------------------------------------------------------------------------------- advancing
     async def _advance(self, now: datetime) -> None:
-        await self._retry_answers(now)
+        for key in self.journal.with_state("answered"):
+            await self._write_answer(key, now)
         await self._expire(now)
         if not self._turn_busy(now):
             key = self.journal.next_queued()
@@ -209,39 +231,43 @@ class VoiceBridge:
                 await self._start(key, now)
         self.journal.prune(now)
 
-    async def _retry_answers(self, now: datetime) -> None:
-        for key in self.journal.with_state("answered"):
-            await self._write_answer(key, now)
+    def _timeout(self) -> timedelta:
+        return timedelta(minutes=self.settings.answer_timeout_minutes)
 
     async def _expire(self, now: datetime) -> None:
-        limit = timedelta(minutes=self.settings.answer_timeout_minutes)
+        if self._session_busy():
+            return  # a turn is still running; the gateway's own turn timeout bounds it
         for key in self.journal.with_state("dispatched"):
-            record = self.journal.get(key) or {}
-            started = _parse(record.get("dispatched_at")) or now
-            if now - started > limit:
-                logger.warning("gemini-voice: no reply for %s within %s; closing it", key, limit)
+            started = from_iso((self.journal.get(key) or {}).get("dispatched_at")) or now
+            if now - started > self._timeout():
+                logger.warning("gemini-voice: no reply for %s within %s; closing it", key, self._timeout())
                 await self._close_with_note(key, "abandoned", self._text["abandoned"], now)
                 self.journal.close_turn(key)
 
     def _turn_busy(self, now: datetime) -> bool:
+        """True while the gateway may still be running the last task's turn: no new task meanwhile."""
+        if self._session_busy():
+            return True
         key = self.journal.open_turn()
         record = self.journal.get(key)
         if record is None:
             return False
-        if record.get("state") == "dispatched":
-            return True
-        finished = _parse(record.get(f"{record.get('state')}_at")) or now
-        if now - finished > TURN_GRACE:
-            self.journal.close_turn(key)  # the gateway never reported the end of the turn
-            return False
-        return True
+        started = from_iso(record.get("dispatched_at")) or now
+        if record.get("state") == "dispatched" and now - started <= self._timeout():
+            return True  # admitted but not visible yet, or about to be resumed after a restart
+        self.journal.close_turn(key)
+        return False
 
     async def _start(self, key: str, now: datetime) -> None:
         record = self.journal.get(key) or {}
+        created = from_iso(record.get("created"))
+        if created and now - created > timedelta(hours=self.settings.max_age_hours):
+            await self._close_with_note(key, "skipped", self._text["stale"], now)
+            return
         day = now.astimezone(self._zone).strftime("%Y-%m-%d")
         if self.journal.count_today(day) >= self.settings.max_tasks_per_day:
-            note = self._text["daily_cap"].format(limit=self.settings.max_tasks_per_day)
-            await self._close_with_note(key, "skipped", note, now)
+            await self._close_with_note(key, "skipped", self._text["daily_cap"].format(
+                limit=self.settings.max_tasks_per_day), now)
             return
         record = self.journal.mark(key, "claimed", now, attempts=int(record.get("attempts") or 0) + 1)
         prompt = await self._claim(key, record, now)
@@ -253,56 +279,76 @@ class VoiceBridge:
         try:
             await self._dispatch(Task(key, record["kind"], record.get("title") or "", prompt))
         except Exception as exc:
-            logger.exception("gemini-voice: gateway refused %s", key)
+            logger.exception("gemini-voice: gateway did not take %s", key)
             await self._close_with_note(key, "failed", self._text["failed"].format(reason=type(exc).__name__), now)
             self.journal.close_turn(key)
 
     async def _claim(self, key: str, record: Dict[str, Any], now: datetime) -> Optional[str]:
-        """Read the task text and write the acknowledgement; None when the task cannot start now."""
+        """Re-check ownership, read the task, write the acknowledgement; None when it must not start."""
         try:
-            text = await self._run(self._read, record)
+            problem = await self._run(self._recheck, record)
+            if problem:
+                logger.info("gemini-voice: ignored %s (%s): changed before it started", key, problem)
+                self.journal.mark(key, "rejected", now, reason=problem)
+                return None
+            text, is_output = await self._run(self._read, record)
+            if is_output:
+                logger.info("gemini-voice: %s is an output of this plugin; not a task", key)
+                self.journal.mark(key, "skipped", now, reason="plugin_output")
+                return None
+            self.journal.mark(key, "claimed", now, acking=True)
             ack = textutil.block(self._text["ack"].format(time=self._local(now)))
-            await self._run(self._write, record, ack)
+            _, locator = await self._run(self._write, record, ack)
         except ApiError as exc:
             logger.warning("gemini-voice: cannot start %s: %s", key, exc.code)
             self.journal.mark(key, "failed", now, reason=exc.code)
             return None
         except (AuthError, TransientError):
-            state = "failed" if int(record.get("attempts") or 0) >= 3 else "queued"
-            self.journal.mark(key, state, now)
+            self.journal.mark(key, "failed" if int(record.get("attempts") or 0) >= 3 else "queued", now)
             raise
+        self.journal.mark(key, "claimed", now, locator=locator)
         return self._prompt(record, text)
 
     def _prompt(self, record: Dict[str, Any], text: str) -> str:
-        created = _parse(record.get("created"))
+        created = from_iso(record.get("created"))
         when = f" · created {self._local(created)}" if created else ""
-        header = f"[Voice task from the owner via the Gemini app · {KIND_NAMES.get(record['kind'], 'Google object')}{when}]"
+        kind = KIND_NAMES.get(record["kind"], "Google object")
         body = textutil.truncate(text.strip(), TASK_TEXT_LIMIT, "[task text shortened]")
-        return f"{header}\n{body}"
+        return f"[Voice task from the owner via the Gemini app · {kind}{when}]\n{body}"
 
     # ------------------------------------------------------------------------------- Google I/O
-    def _read(self, record: Dict[str, Any]) -> str:
-        kind, obj_id, title = record["kind"], record["id"], record.get("title") or ""
-        if kind == "cal":
-            return self.calendar.read(obj_id)
-        if kind == "doc":
-            return self.docs.read(obj_id, title)
-        return self.sheets.read(obj_id, title)
+    def _recheck(self, record: Dict[str, Any]) -> str:
+        if record["kind"] == "cal":
+            problem = self.calendar.recheck(record["id"])
+            # our own earlier acknowledgement moves ``updated``: that edit is ours, not someone else's
+            return "" if problem == "edited_after_creation" and record.get("acking") else problem
+        return self.drive.recheck(record["id"])
 
-    def _write(self, record: Dict[str, Any], block_text: str) -> int:
+    def _read(self, record: Dict[str, Any]) -> Tuple[str, bool]:
+        """``(task text, whether the object is an output of this plugin)``."""
+        kind, obj_id, title, locator = record["kind"], record["id"], record.get("title") or "", record.get("locator")
+        if kind == "cal":
+            return self.calendar.read(obj_id, locator), False
+        if kind == "doc":
+            body = self.docs.read_body(obj_id, locator)
+            return f"{title}\n{body}".strip(), textutil.is_output(body)
+        return self.sheets.read(obj_id, title, locator), False
+
+    def _write(self, record: Dict[str, Any], block_text: str) -> Tuple[int, Locator]:
         kind, obj_id = record["kind"], record["id"]
         writer = {"cal": self.calendar.write, "doc": self.docs.write, "sheet": self.sheets.write}[kind]
-        status = writer(obj_id, block_text)
+        status, locator = writer(obj_id, block_text, record.get("locator"))
         logger.info("gemini-voice: wrote to %s.%s HTTP %s", kind, obj_id, status)
-        return status
+        return status, locator
 
     async def _close_with_note(self, key: str, state: str, note: str, now: datetime) -> None:
         record = self.journal.get(key) or {}
+        locator = record.get("locator")
         try:
-            await self._run(self._write, record, textutil.block(note))
+            _, locator = await self._run(self._write, record, textutil.block(note))
         except GoogleError as exc:
             logger.warning("gemini-voice: could not write the %s note to %s: %s", state, key, exc.code)
-        self.journal.mark(key, state, now)
+        self.journal.mark(key, state, now, locator=locator)
 
     async def _write_answer(self, key: str, now: datetime) -> None:
         record = self.journal.get(key) or {}
@@ -310,15 +356,15 @@ class VoiceBridge:
         body = textutil.truncate(record.get("answer") or "", limit, self._text["truncated"])
         header = self._text["reply"].format(time=self._local(now))
         try:
-            status = await self._run(self._write, record, textutil.block(header, body))
+            status, locator = await self._run(self._write, record, textutil.block(header, body))
         except ApiError as exc:
             logger.warning("gemini-voice: reply to %s refused by Google: %s", key, exc.code)
-            self.journal.mark(key, "failed", now, reason=exc.code)
+            await self._close_with_note(key, "failed", self._text["failed"].format(reason=exc.code), now)
             return
         except (AuthError, TransientError) as exc:
             logger.warning("gemini-voice: reply to %s not written yet (%s); will retry", key, exc.code)
             return
-        self.journal.mark(key, "done", now, http=status)
+        self.journal.mark(key, "done", now, http=status, locator=locator)
 
     # -------------------------------------------------------------------------- gateway callbacks
     async def deliver_answer(self, reply_to: Optional[str], content: str) -> bool:
@@ -327,24 +373,26 @@ class VoiceBridge:
             now = self._clock()
             key = self._route(reply_to)
             if key is None:
-                logger.warning("gemini-voice: a reply arrived with no open task; dropped")
+                logger.warning("gemini-voice: a reply for %s has no task to go to; dropped", reply_to or "no anchor")
                 return False
             self.journal.mark(key, "answered", now, answer=textutil.plain_text(content))
             await self._write_answer(key, now)
             return True
 
     def _route(self, reply_to: Optional[str]) -> Optional[str]:
-        for key in (reply_to, self.journal.open_turn()):
-            record = self.journal.get(key)
-            if record is not None and record.get("state") in ("dispatched", "answered"):
-                return key
-        return None
+        """The anchor decides. Only an anchorless reply (a turn the gateway resumed after a restart)
+        goes to the task whose turn is open."""
+        if reply_to:
+            return reply_to if self.journal.get(reply_to) is not None else None
+        key = self.journal.open_turn()
+        state = (self.journal.get(key) or {}).get("state")
+        return key if state in ("dispatched", "answered", "done") else None
 
     async def on_turn_complete(self, message_id: Optional[str], outcome: str, streamed: str = "") -> None:
-        """End of a gateway turn: close tasks that ended without a reply; free the queue."""
+        """End of a gateway turn: close a task that ended without a reply; free the queue."""
         async with self._lock:
             now = self._clock()
-            key = message_id if self.journal.get(message_id) else self.journal.open_turn()
+            key = message_id if message_id else self.journal.open_turn()
             record = self.journal.get(key)
             if record is None or outcome == "cancelled":
                 return  # a cancelled turn may be resumed by the gateway; the answer timeout still applies
@@ -353,48 +401,64 @@ class VoiceBridge:
                     self.journal.mark(key, "answered", now, answer=textutil.plain_text(streamed))
                     await self._write_answer(key, now)
                 elif outcome == "success":
-                    await self._close_with_note(key, "done", self._text["done_silent"].format(time=self._local(now)), now)
+                    note = self._text["done_silent"].format(time=self._local(now))
+                    await self._close_with_note(key, "done", note, now)
                 else:
                     await self._close_with_note(key, "failed", self._text["failed"].format(reason="turn error"), now)
             self.journal.close_turn(key)
 
     async def deliver_output(self, target: str, content: str) -> Tuple[bool, str]:
         """Cron delivery: ``doc`` creates a document, ``event-HHMM`` creates or updates a slot event."""
-        now = self._clock()
-        title, body = split_title(textutil.plain_text(content), f"Hermes {self._local(now)}")
         slot = _SLOT.match(target or "")
-        try:
-            if target in ("doc", ""):
-                doc_id, status = await self._run(self.docs.create, title, body)
-                self.journal.add_outbound(doc_id, now)
+        if target not in ("doc", "") and not slot:
+            return False, f"unknown target {target!r}: use 'doc' or 'event-HHMM'"
+        async with self._lock:
+            now = self._clock()
+            title, body = split_title(textutil.plain_text(content), f"Digest {self._local(now)}")
+            try:
+                if slot:
+                    event_id, status = await self._run(self.calendar_output.upsert, slot.group(1) + slot.group(2),
+                                                       title, body, self._zone, self._zone_name, now)
+                    logger.info("gemini-voice: delivered to cal.%s HTTP %s", event_id, status)
+                    return True, f"cal.{event_id}"
+                doc_id = await self._run(self.docs.create_blank, title)
+                self.journal.add_outbound(doc_id, now)  # recorded before any text exists in it
+                status = await self._run(self.docs.fill_output, doc_id, title, body)
                 logger.info("gemini-voice: delivered to new doc.%s HTTP %s", doc_id, status)
                 return True, f"doc.{doc_id}"
-            if slot:
-                event_id, status = await self._run(self.calendar_output.upsert, slot.group(1) + slot.group(2),
-                                                   title, body, self._zone, self._zone_name, now)
-                logger.info("gemini-voice: delivered to cal.%s HTTP %s", event_id, status)
-                return True, f"cal.{event_id}"
-        except GoogleError as exc:
-            logger.warning("gemini-voice: delivery to %s failed: %s", target, exc.code)
-            return False, exc.code
-        return False, f"unknown target {target!r}: use 'doc' or 'event-HHMM'"
+            except GoogleError as exc:
+                logger.warning("gemini-voice: delivery to %s failed: %s", target, exc.code)
+                return False, exc.code
 
     # ------------------------------------------------------------------------------------ status
     def _set_status(self, state: str, code: str, message: str) -> None:
         if self._status == (state, code):
             return
         self._status = (state, code)
-        self.journal.set_status(state, code, message, self._clock())
-        try:
+        try:  # the gateway status comes first; a failing state file must not hide it
             self._publish(state, code, message)
         except Exception:
             logger.warning("gemini-voice: could not publish platform status %s/%s", state, code, exc_info=True)
+        try:
+            self.journal.set_status(state, code, message, self._clock())
+        except Exception:
+            logger.warning("gemini-voice: could not save the status to the state file", exc_info=True)
 
-    def _on_success(self) -> None:
+    def _on_success(self, problems: List[ApiError]) -> None:
         if self._auth_failed_at is not None or self._backoff:
             logger.info("gemini-voice: Google reachable and authorized again")
         self._auth_failed_at, self._backoff = None, 0.0
-        self._set_status("connected", "", "")
+        if not problems:
+            self._set_status("connected", "", "")
+            return
+        code = problems[0].code
+        if code == "api_disabled":
+            message = "A Google API is disabled: enable Calendar, Drive, Docs and Sheets in the OAuth client's project."
+        else:
+            message = f"Google refused a polling request ({code}); the other sources keep working."
+        if self._status != ("retrying", code):
+            logger.warning("gemini-voice: %s", message)
+        self._set_status("retrying", code, message)
 
     def _on_auth_error(self, exc: AuthError, now: datetime) -> float:
         message = (f"Google authorization failed ({exc.code}); polling paused. Run `hermes gemini-voice auth` "
@@ -414,15 +478,5 @@ class VoiceBridge:
         self._set_status("retrying", "google_unreachable", f"Google API unreachable ({exc.code}); retrying.")
         return self._backoff
 
-    def _on_api_error(self, exc: ApiError) -> float:
-        message = (f"Google refused a polling request ({exc.code}). Check that the Calendar, Drive, Docs and "
-                   "Sheets APIs are enabled in the OAuth client's Cloud project.")
-        logger.warning("gemini-voice: %s", message)
-        self._set_status("retrying", exc.code, message)
-        return float(self.settings.poll_seconds * 5)
-
     def _local(self, moment: Optional[datetime]) -> str:
         return textutil.time_label((moment or self._clock()).astimezone(self._zone))
-
-
-_parse = from_iso

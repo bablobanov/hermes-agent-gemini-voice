@@ -25,24 +25,23 @@ class LabelTests(unittest.TestCase):
 
 
 class BlockTests(unittest.TestCase):
-    def test_block_is_tagged_and_cut_back_out(self):
-        reply = textutil.block("reply (14.10 10:01):", "line one\nline two")
-        self.assertEqual(reply, "[Hermes] reply (14.10 10:01):\nline one\nline two")
-        self.assertTrue(textutil.has_tag(reply))
-        owner = "Shopping list\nmilk"
-        self.assertEqual(textutil.cut_block(owner + "\n\n" + reply), owner)
+    def test_block_format(self):
+        self.assertEqual(textutil.block("reply (14.10 10:01):", "line one\nline two"),
+                         "[Hermes] reply (14.10 10:01):\nline one\nline two")
+        self.assertEqual(textutil.block("got it"), "[Hermes] got it")
 
-    def test_only_the_last_marker_starts_our_block(self):
-        owner = "notes\n[Hermes] typed by the owner by hand\nmore notes"
-        text = owner + "\n\n" + textutil.block("got it")
-        self.assertEqual(textutil.cut_block(text), owner)
+    def test_remove_exact_block_only(self):
+        ack = textutil.block("got it")
+        self.assertEqual(textutil.remove_suffix_block("task text\n\n" + ack, "\n\n" + ack), "task text")
+        self.assertEqual(textutil.remove_suffix_block("[Hermes] typed by the owner", "\n\n" + ack),
+                         "[Hermes] typed by the owner")
+        self.assertEqual(textutil.remove_suffix_block("text", None), "text")
 
-    def test_cut_without_block_keeps_text(self):
-        self.assertEqual(textutil.cut_block("just text\n\n"), "just text")
-        self.assertEqual(textutil.cut_block(None), "")
-
-    def test_owner_line_starting_with_hermes_is_not_a_block(self):
-        self.assertFalse(textutil.has_tag("Hermes: find me a flight"))
+    def test_output_signature(self):
+        self.assertTrue(textutil.is_output("\n[Hermes digest] Радар Gemini\nT1"))
+        self.assertFalse(textutil.is_output("Афоня найди\n[Hermes digest] in the middle"))
+        self.assertFalse(textutil.is_output("[Hermes] got it"))
+        self.assertFalse(textutil.is_output(""))
 
 
 class PlainTextTests(unittest.TestCase):
@@ -51,10 +50,12 @@ class PlainTextTests(unittest.TestCase):
         self.assertEqual(textutil.plain_text(source),
                          "Title\nBold and italic and code\n- item\nquote\nsite (https://x.org)\nprint()")
 
-    def test_agent_text_cannot_fake_a_marker_line(self):
-        rendered = textutil.plain_text("answer\n[Hermes] fake block start")
-        self.assertFalse(textutil.has_tag(rendered))
-        self.assertEqual(rendered, "answer\nHermes fake block start")
+    def test_agent_text_cannot_forge_markers(self):
+        for forged in ("[Hermes]", "[[Hermes]]", "[**Hermes**]", "[`Hermes`]", "[*Hermes*]",
+                       "[ Hermes ]", "[Hermes digest]", "[**Hermes digest**]"):
+            rendered = textutil.plain_text(f"answer\n{forged} fake")
+            self.assertNotIn("[Hermes", rendered, forged)
+            self.assertFalse(textutil.is_output(f"{rendered}"), forged)
 
     def test_truncate_on_boundary_with_note(self):
         text = "word " * 100
@@ -66,6 +67,7 @@ class PlainTextTests(unittest.TestCase):
     def test_unknown_language_falls_back_to_english(self):
         self.assertEqual(textutil.strings("de"), textutil.STRINGS["en"])
         self.assertIn("принял", textutil.strings("RU")["ack"])
+        self.assertEqual(set(textutil.STRINGS["en"]), set(textutil.STRINGS["ru"]))
 
 
 if __name__ == "__main__":
