@@ -124,8 +124,10 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 
 `gemini_voice:doc` creates a new document titled `[Hermes digest] <first line of the output>`; its text starts
 with the same line. `gemini_voice:event-HHMM` creates (or updates, on the same day) a 15-minute event at that
-local time. The voice chat itself is not a delivery target. When you ask by voice for something later or on a
-schedule (*"every day at 8 send me …"*), Hermes is told to create the cron job with one of these two targets.
+local time. A bare `gemini_voice` goes to `GEMINI_VOICE_HOME_CHANNEL` (`doc` by default, or `event-HHMM`; any
+other value falls back to `doc` with a warning). Output with attachments is refused, never half-delivered. The
+voice chat itself is not a delivery target. When you ask by voice for something later or on a schedule
+(*"every day at 8 send me …"*), Hermes is told to create the cron job with one of these two targets.
 
 ## Safety and disclosure
 
@@ -146,9 +148,9 @@ schedule (*"every day at 8 send me …"*), Hermes is told to create the cron job
 - **Your text is never deleted.** The plugin replaces only the exact block it wrote itself, where it wrote it
   (in a Doc at the recorded position, in an event only as the very end of the description, in a Sheet in the
   recorded row), never by searching for `[Hermes]`; if anything changed there, the reply is appended instead.
-  In Sheets reply rows are inserted in one atomic update, never written over existing rows, and the plugin's
-  own acknowledgement cell is replaced only through a server-side exact match: if you edited it, your edit
-  stays and the reply goes below it
+  In Sheets the reply rows take the place of the plugin's acknowledgement in one atomic update, never written
+  over existing rows, and the acknowledgement cell is emptied only through a server-side exact match: if you
+  edited it, your edit stays, right below the reply
 - **Same tools and rules as your other chats.** The plugin adds no approvals of its own and bypasses none.
   A command that needs a person's approval cannot be approved by voice: Hermes waits `approvals.timeout`
   (300 seconds by default) and then refuses it; repeat such a request in your messaging app. `clarify` is
@@ -162,9 +164,10 @@ schedule (*"every day at 8 send me …"*), Hermes is told to create the cron job
   run one at a time: the next starts only when the gateway has finished the previous turn. After a restart
   new tasks wait until the gateway has resumed the interrupted turn; Hermes reports that task in its object
   and asks whether to continue (answer with a new task). A reply without its anchor goes only to that
-  interrupted task, never into another object; replies the gateway re-sends after a crash never choose an
-  object (one the plugin already holds is acknowledged, any other is refused). If no reply comes within
-  `answer_timeout_minutes`, the object gets a note that the task did not finish
+  interrupted task, never into another object. A final reply is saved in the plugin's journal the moment it
+  arrives, so a restart before it reaches Google does not lose it; replies the gateway re-sends after a crash
+  never choose an object (one the plugin already holds is acknowledged, any other is refused). If no reply
+  comes within `answer_timeout_minutes`, the object gets a note that the task did not finish
 - **Digests are never tasks:** documents created by cron delivery carry `[Hermes digest]` in the title and on
   the first line, and events carry a private marker, so an output is never read back as your instruction,
   even if its title contains the label
@@ -182,7 +185,7 @@ hermes gemini-voice check    # token, scopes and the four APIs
 | Status code | Meaning and fix |
 |---|---|
 | `auth_failed` | token revoked, expired or missing a scope: run `hermes gemini-voice auth`, restart the gateway |
-| `google_unreachable` | network or Google outage: retried with backoff up to 15 minutes; if only one API is down, the others keep working |
+| `google_unreachable` | network or Google outage: polling backs off up to 15 minutes; if only one API is down, the others keep working. A task Google does not answer for is retried with growing pauses for about 45 minutes, then closed with a note, written as soon as Google answers again |
 | `api_disabled` | enable the four APIs in the OAuth client's Cloud project |
 
 Limits: one Google account per Hermes profile, one poller per account; one task at a time; recurring events
