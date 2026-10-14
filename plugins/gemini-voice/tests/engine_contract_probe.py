@@ -1,6 +1,7 @@
 """Contract probe run in a child process against a real Hermes checkout (see test_engine_contract.py).
 
 argv: <engine root> <plugin dir>. HERMES_HOME must point to an empty temporary directory.
+GEMINI_VOICE_TEST_SYS_PATH (JSON list), when set, goes ahead of this interpreter's own path.
 Prints one JSON object: {check name: [ok, detail]}.
 """
 
@@ -421,6 +422,8 @@ def probe() -> dict:
 
 def main() -> int:
     engine_root, plugin_dir = Path(sys.argv[1]), Path(sys.argv[2])
+    inherited = json.loads(os.environ.get("GEMINI_VOICE_TEST_SYS_PATH") or "[]")
+    sys.path[:] = [*inherited, *(entry for entry in sys.path if entry not in inherited)]
     sys.path.insert(0, str(engine_root))
     install(plugin_dir, Path(os.environ["HERMES_HOME"]))
     print(json.dumps(probe(), ensure_ascii=False))
