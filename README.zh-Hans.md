@@ -116,11 +116,11 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 ```
 
 `gemini_voice:doc` 会新建一个标题为 `[Hermes digest] <输出的第一行>` 的文档，正文也以这一行开头。`gemini_voice:event-HHMM`
-会在该本地时间新建一个 15 分钟的事件（同一天再次投递时更新它）。只写 `gemini_voice` 时投递到 `GEMINI_VOICE_HOME_CHANNEL`
-（`doc` 或 `event-HHMM`；其他值会改为 `doc` 并在日志中警告）。这里的目标就是平台的主频道，只有你明确指定时才存在：上述变量，或
-`config.yaml` 中 `platforms.gemini_voice` 下的 `home_channel`。没有主频道时，只写 `gemini_voice` 不会投递，Hermes 发往主频道的
-服务通知也不会进入你的 Google 账号。有主频道时，这些通知也会发到那里：计划重启后的“重新上线”消息和存储故障警告会按目标新建文档或
-更新事件；关机通知始终被插件拒绝。带附件的输出会被拒绝，不会只投递一半。语音会话本身不是投递目标。当你用语音要求以后或定期做某事
+会在该本地时间新建一个 15 分钟的事件（同一天再次投递时更新它）。只写 `gemini_voice` 时投递到平台的主频道，而只有你明确指定时才有
+主频道：`GEMINI_VOICE_HOME_CHANNEL`（`doc` 或 `event-HHMM`；其他值会改为 `doc` 并在日志中警告），或 `config.yaml` 中
+`platforms.gemini_voice` 下的 `home_channel`。没有主频道时，只写 `gemini_voice` 不会投递，Hermes 发往主频道的服务通知也不会进入
+你的 Google 账号。有主频道时，这些通知也会发到那里：计划重启后的“重新上线”消息和存储故障警告会按目标新建文档，或新建/更新事件；
+关机通知始终被插件拒绝。带附件的输出会被拒绝，不会只投递一半。语音会话本身不是投递目标。当你用语音要求以后或定期做某事
 （*“每天 8 点给我发 …”*）时，Hermes 会被告知用这两个目标之一创建定时任务。
 
 ## 安全与披露

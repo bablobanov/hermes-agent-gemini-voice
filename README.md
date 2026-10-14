@@ -129,8 +129,8 @@ local time. A bare `gemini_voice` goes to the platform's home channel, which exi
 `GEMINI_VOICE_HOME_CHANNEL` (`doc` or `event-HHMM`; any other value falls back to `doc` with a warning) or a
 `home_channel` under `platforms.gemini_voice` in `config.yaml`. Without one a bare `gemini_voice` is not delivered,
 and Hermes's own notices to home channels never reach your Google account. With one, they land there too: the
-"back online" message after a planned restart and storage warnings become a new document or update the event,
-depending on the target; the shutdown notice is always refused. Output with attachments is refused, never
+"back online" message after a planned restart and storage warnings become a new document or create or update
+an event, depending on the target; the shutdown notice is always refused. Output with attachments is refused, never
 half-delivered. The
 voice chat itself is not a delivery target. When you ask by voice for something later or on a schedule
 (*"every day at 8 send me …"*), Hermes is told to create the cron job with one of these two targets.
