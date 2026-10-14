@@ -1,6 +1,6 @@
 # Hermes Agent Gemini Voice
 
-![Hermes Agent Gemini Voice: talk to your Hermes Agent from an Android phone with Gemini Live](assets/hermes-agent-gemini-live-voice-android.svg)
+![Hermes Agent Gemini Voice: говорите со своим Hermes Agent с телефона Android через Gemini Live](assets/hermes-agent-gemini-live-voice-android.svg)
 
 [English](README.md) · [简体中文](README.zh-Hans.md) · [Безопасность](SECURITY.md) · [Изменения](CHANGELOG.md)
 
@@ -45,7 +45,8 @@
 
 ## Что нужно
 
-- Hermes Agent **0.21.6 или новее** с запущенным шлюзом сообщений (плагин - это платформа шлюза)
+- Hermes Agent **0.21.6 или новее** с запущенным шлюзом сообщений (плагин - это платформа шлюза).
+  Проверено живьём на 0.21.6; контрактный тест движка (50 проверок) проходит на 0.21.6 и 0.22.0
 - Аккаунт Google, который используется в приложении Gemini на телефоне
 - Свой проект Google Cloud для этого аккаунта (бесплатно) с включёнными **Google Calendar, Google Drive, Google Docs
   и Google Sheets API** и **OAuth-клиентом типа «Desktop app»**
@@ -161,6 +162,13 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
   которой нужно одобрение человека, голосом одобрить нельзя: Hermes ждёт `approvals.timeout` (по умолчанию 300 секунд)
   и отклоняет её; повторите такую просьбу в мессенджере. `clarify` на этой платформе заблокирован: посреди хода
   ответить некому
+- **Внутренности движка:** кроме документированного API плагинов, плагин импортирует
+  `gateway.session_context.get_session_env` (хук `pre_tool_call` не сообщает, на какой платформе идёт вызов
+  инструмента, а `clarify` блокируется только здесь) и читает несколько атрибутов с подчёркиванием у базового класса
+  адаптера, раннера шлюза и событий шлюза: идёт ли ещё ход голосового чата, возобновляет ли шлюз ходы после
+  рестарта, текст финального ответа из стрима, запись статуса. `hermes plugins validate` на 0.22.0 показывает импорт
+  предупреждением по правилу каталога 9. Всё это покрывает контрактный тест движка: прогоните его против новой
+  версии Hermes до обновления (см. [Тесты](#тесты))
 - **Фоновая работа:** задача опроса внутри процесса шлюза, пока платформа подключена
 - **Сам по себе позже ничего не придёт.** Голосовой чат принимает только финальный ответ поручения. Фоновые процессы его
   не будят; сообщения в него из других чатов, вложения (файлы, картинки, аудио) и запросы одобрения отклоняются и
@@ -211,6 +219,14 @@ python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-v
 ```sh
 GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
   python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -p test_engine_contract.py -v
+```
+
+В установке под менеджером окружения Hermes (0.21.6 и новее) зависимости движка видны только через его лаунчер:
+интерпретатор не задавайте, тесты запускайте через лаунчер.
+
+```sh
+GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> \
+  <HERMES_CHECKOUT>/.hermes/bin/hermes --run-module unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -v
 ```
 
 ## Проект

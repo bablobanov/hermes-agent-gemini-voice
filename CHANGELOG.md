@@ -37,4 +37,6 @@
   page token); a second holding more changes than a poll reads is read deeper in the same poll, so a burst of
   changes hides nothing; a task Google does not answer for is retried with growing pauses for about 45
   minutes, then closed with a note that is written as soon as Google answers again
-- Standard library only; unit tests without network, optional contract test against a Hermes checkout
+- Standard library only; unit tests without network, optional contract test against a Hermes checkout (passes
+  on 0.21.6 and 0.22.0; on an install managed by Hermes's environment manager it runs through the engine's
+  launcher, `hermes --run-module unittest`)

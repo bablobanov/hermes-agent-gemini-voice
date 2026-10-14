@@ -1,6 +1,6 @@
 # Hermes Agent Gemini Voice
 
-![Hermes Agent Gemini Voice: talk to your Hermes Agent from an Android phone with Gemini Live](assets/hermes-agent-gemini-live-voice-android.svg)
+![Hermes Agent Gemini Voice：通过 Gemini Live 在 Android 手机上与你的 Hermes Agent 对话](assets/hermes-agent-gemini-live-voice-android.svg)
 
 [English](README.md) · [Русский](README.ru.md) · [安全](SECURITY.md) · [更新日志](CHANGELOG.md)
 
@@ -40,7 +40,9 @@ Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 
 
 ## 前提条件
 
-- Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）
+- Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
+  引擎契约测试（50 项检查）在 0.21.6 和 0.22.0 上均通过
+- 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
 - 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，
   并创建一个类型为 **“桌面应用”（Desktop app）的 OAuth 客户端**
@@ -140,6 +142,11 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 - **与其他聊天相同的工具和规则。** 插件不增加自己的审批，也不绕过任何审批。需要人工批准的命令无法通过语音批准：Hermes 会
   等待 `approvals.timeout`（默认 300 秒）后拒绝它；请在你的消息应用中重新发出这类请求。`clarify` 在此平台被禁用，因为回合
   进行中没人能回答
+- **引擎内部接口：** 除了文档化的插件 API，插件还导入 `gateway.session_context.get_session_env`（`pre_tool_call`
+  钩子不会说明工具调用发生在哪个平台，而 `clarify` 只在本平台被禁用），并读取适配器基类、网关运行器和网关事件上的几个
+  下划线属性：语音会话的回合是否仍在进行、网关是否在重启后恢复回合、流式输出的最终文本、状态写入。0.22.0 的
+  `hermes plugins validate` 会把这个导入列为目录规则 9 的警告。引擎契约测试覆盖了以上每一项：升级 Hermes 之前，请先用新版本
+  运行它（见[测试](#测试)）
 - **后台工作：** 平台连接期间，网关进程内有一个轮询任务
 - **不会有消息自行晚到。** 语音会话只接收任务的最终回复。后台进程不会唤醒它；从其他聊天发给它的消息、附件（文件、图片、
   音频）和审批请求都会被拒绝，绝不会报告为已送达。以后要看的结果通过定时投递写入新文档或事件（见[使用](#使用)）
@@ -182,6 +189,14 @@ python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-v
 ```sh
 GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
   python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -p test_engine_contract.py -v
+```
+
+在由 Hermes 环境管理器管理的安装（0.21.6 及更高版本）中，引擎的依赖只能通过其启动器看到：不要指定 Python，
+通过启动器运行测试。
+
+```sh
+GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> \
+  <HERMES_CHECKOUT>/.hermes/bin/hermes --run-module unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -v
 ```
 
 ## 项目

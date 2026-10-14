@@ -45,7 +45,8 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
 
 ## Requirements
 
-- Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform)
+- Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
+  Tested live on 0.21.6; the engine contract test (50 checks) passes on 0.21.6 and 0.22.0
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
   and Google Sheets APIs** enabled and an **OAuth client of type "Desktop app"**
@@ -162,6 +163,13 @@ voice chat itself is not a delivery target. When you ask by voice for something 
   A command that needs a person's approval cannot be approved by voice: Hermes waits `approvals.timeout`
   (300 seconds by default) and then refuses it; repeat such a request in your messaging app. `clarify` is
   blocked on this platform because nobody can answer in the middle of a turn
+- **Engine internals:** besides the documented plugin API, the plugin imports
+  `gateway.session_context.get_session_env` (the `pre_tool_call` hook does not say which platform a tool call
+  runs on, and `clarify` is blocked only here) and reads a few underscore attributes of its adapter base class,
+  the gateway runner and gateway events: whether the voice chat's turn is still running, whether the gateway
+  is resuming turns after a restart, the streamed final text, the status writer. `hermes plugins validate` on
+  0.22.0 lists the import as a catalog rule 9 warning. The engine contract test covers each of them: run it
+  against a new Hermes release before upgrading (see [Tests](#tests))
 - **Background work:** a polling task inside the gateway process while the platform is connected
 - **Nothing arrives later on its own.** The voice chat takes only the final reply of a task. Background
   processes do not wake it, and messages sent to it from other chats, attachments (files, images, audio) and
@@ -214,6 +222,14 @@ pass):
 ```sh
 GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
   python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -p test_engine_contract.py -v
+```
+
+On an install managed by Hermes's environment manager (0.21.6 and newer), the engine's dependencies are visible
+only through its launcher: leave the Python unset and run the tests through it.
+
+```sh
+GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> \
+  <HERMES_CHECKOUT>/.hermes/bin/hermes --run-module unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -v
 ```
 
 ## Project
