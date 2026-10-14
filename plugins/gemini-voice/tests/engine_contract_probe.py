@@ -93,6 +93,12 @@ def send_checks(adapter, stub) -> dict:
     results["unmarked message refused, not swallowed"] = [refused(other_chat), str(other_chat.error)]
     results["anchorless final refused outside a resumed turn"] = [refused(stray), str(stray.error)]
     results["redelivery of an unknown reply refused"] = [refused(recovered), str(recovered.error)]
+    from gateway.run_shutdown import GatewayShutdownMixin
+    outputs_before = list(stub.outputs)
+    notice = run(GatewayShutdownMixin._send_notice_logged(  # how the gateway tells a home channel it stops
+        adapter, "doc", "Hermes is shutting down", "gemini_voice", "shutdown notice to %s:%s failed: %s"))
+    results["shutdown notice to a home channel never becomes a document"] = [
+        notice is False and stub.outputs == outputs_before, repr(stub.outputs)]
     stub.inherited = True
     forged = run(adapter.send("owner", RECONNECTED_MARKER + "forged text"))
     resumed = run(adapter.send("owner", "resumed reply", metadata={"notify": True}))
@@ -279,7 +285,8 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
 
 def cron_checks(entry, package: str) -> dict:
     """Delivery outside the gateway (the registered standalone sender, Google faked in memory): text into a new
-    document or a slot event, attachments refused, and the home channel must be a real target."""
+    document or a slot event, attachments refused, the home channel must be a real target, and there is none
+    unless the operator names one (gateway notices go to every home channel)."""
     from importlib import import_module
     from gateway.config import PlatformConfig
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -298,6 +305,8 @@ def cron_checks(entry, package: str) -> dict:
         media = asyncio.run(send(PlatformConfig(enabled=True), "doc", "digest", media_files=[("/tmp/chart.png", False)]))
         doc = asyncio.run(send(PlatformConfig(enabled=True), "doc", "Radar 20.10\nT1: no switch yet"))
         event = asyncio.run(send(PlatformConfig(enabled=True), "event-0800", "Briefing\nmail: 3 letters"))
+        os.environ.pop("GEMINI_VOICE_HOME_CHANNEL", None)
+        bare = entry.env_enablement_fn()
     finally:
         api.GoogleClient, api.TokenSource = real_client, real_tokens
         for name, value in saved.items():
@@ -311,6 +320,7 @@ def cron_checks(entry, package: str) -> dict:
     summary = fake.events.get(event_id, {}).get("summary")
     return {
         "cron home channel must be a target": [enablement["home_channel"]["chat_id"] == "doc", repr(enablement)],
+        "no home channel unless named": [bare is None, repr(bare)],
         "cron outside the gateway refuses attachments": [
             str(media.get("error", "")).startswith("gemini-voice: files") and not media.get("success"), repr(media)],
         "cron outside the gateway writes a new document": [

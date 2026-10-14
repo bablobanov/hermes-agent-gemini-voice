@@ -28,7 +28,7 @@ requires_env:
     password: true
 optional_env:
   - name: GEMINI_VOICE_HOME_CHANNEL
-    description: "Where `deliver: gemini_voice` cron output goes: doc (a new document, default) or event-HHMM"
+    description: "Target of a bare `deliver: gemini_voice`: doc (a new document) or event-HHMM. Unset by default: it also becomes the home channel that Hermes's own notices go to"
     prompt: "Default cron delivery target"
     password: false
 config_schema:

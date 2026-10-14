@@ -27,6 +27,7 @@ REFUSED = "gemini-voice: "
 NOT_A_TARGET = ("the voice chat only takes the final reply of a voice task; deliver to gemini_voice:doc "
                 "(a new document) or gemini_voice:event-HHMM (an event at that local time)")
 NO_ATTACHMENTS = TEXT_ONLY
+NOT_CONTENT = "gateway status notices are not written into Google objects"
 
 
 def _message_id() -> str:
@@ -115,6 +116,10 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
             # "delivery failed" notice, sent with the same anchor and written as the task's reply.
             return _refuse("gemini-voice is not connected")
         if str(chat_id) != OWNER_CHAT:
+            if meta.get("_interim_send"):
+                # The gateway's shutdown notice to a home channel (and any other status send): never a new
+                # Google object. Refused, so nothing claims it was written.
+                return _refuse(NOT_CONTENT)
             ok, ref = await bridge.deliver_output(str(chat_id), content)
             return SendResult(success=ok, message_id=ref if ok else None, error=None if ok else ref)
         if meta.get("job_id"):

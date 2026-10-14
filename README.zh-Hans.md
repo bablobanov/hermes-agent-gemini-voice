@@ -41,7 +41,7 @@ Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 
 ## 前提条件
 
 - Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
-  引擎契约测试（50 项检查）在 0.21.6 和 0.22.0 上均通过
+  引擎契约测试（52 项检查）在 0.21.6 和 0.22.0 上均通过
 - 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
 - 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，
@@ -117,7 +117,9 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 
 `gemini_voice:doc` 会新建一个标题为 `[Hermes digest] <输出的第一行>` 的文档，正文也以这一行开头。`gemini_voice:event-HHMM`
 会在该本地时间新建一个 15 分钟的事件（同一天再次投递时更新它）。只写 `gemini_voice` 时投递到 `GEMINI_VOICE_HOME_CHANNEL`
-（默认 `doc`，或 `event-HHMM`；其他值会改为 `doc` 并在日志中警告）。带附件的输出会被拒绝，不会只投递一半。语音会话本身不是投递目标。当你用语音要求以后或定期做某事
+（`doc` 或 `event-HHMM`；其他值会改为 `doc` 并在日志中警告），未设置该变量时不会投递。该变量会把目标设为平台的主频道，而
+Hermes 也会向主频道发送自己的通知：计划重启后的“重新上线”消息会变成一个新文档（关机通知会被插件拒绝）。不设置它，网关的服务通知
+就不会进入你的 Google 账号。带附件的输出会被拒绝，不会只投递一半。语音会话本身不是投递目标。当你用语音要求以后或定期做某事
 （*“每天 8 点给我发 …”*）时，Hermes 会被告知用这两个目标之一创建定时任务。
 
 ## 安全与披露

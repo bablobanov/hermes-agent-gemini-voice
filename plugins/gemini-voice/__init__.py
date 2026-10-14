@@ -62,9 +62,15 @@ def _is_connected(_config: Any = None) -> bool:
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
+    """A home channel only when the operator names one. Hermes sends its own notices (shutting down, back
+    online, storage warnings) to every home channel, and here each would become a new Google object. Without
+    GEMINI_VOICE_HOME_CHANNEL a bare ``deliver: gemini_voice`` has no target; gemini_voice:doc and
+    gemini_voice:event-HHMM work either way."""
     if not _is_connected():
         return None
-    home = (_read_secret(HOME_CHANNEL_ENV) or "doc").strip()
+    home = (_read_secret(HOME_CHANNEL_ENV) or "").strip()
+    if not home:
+        return None
     if not valid_target(home):
         logger.warning("gemini-voice: %s=%r is not a delivery target (use doc or event-HHMM); using doc",
                        HOME_CHANNEL_ENV, home)
