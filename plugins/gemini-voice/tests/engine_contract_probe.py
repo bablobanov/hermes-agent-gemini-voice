@@ -283,6 +283,15 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
     }
 
 
+def enabled_platform(entry):
+    """The platform's config after the gateway's enablement from env (credentials present, no YAML entry)."""
+    from gateway.config import GatewayConfig, Platform
+    from gateway.config_env import _enable_plugin_platform
+    config = GatewayConfig()
+    _enable_plugin_platform(config, entry)
+    return config.platforms.get(Platform("gemini_voice"))
+
+
 def cron_checks(entry, package: str) -> dict:
     """Delivery outside the gateway (the registered standalone sender, Google faked in memory): text into a new
     document or a slot event, attachments refused, the home channel must be a real target, and there is none
@@ -307,6 +316,9 @@ def cron_checks(entry, package: str) -> dict:
         event = asyncio.run(send(PlatformConfig(enabled=True), "event-0800", "Briefing\nmail: 3 letters"))
         os.environ.pop("GEMINI_VOICE_HOME_CHANNEL", None)
         bare = entry.env_enablement_fn()
+        unnamed = enabled_platform(entry)  # the gateway's own enablement path, as at startup
+        os.environ["GEMINI_VOICE_HOME_CHANNEL"] = "doc"
+        named = enabled_platform(entry)
     finally:
         api.GoogleClient, api.TokenSource = real_client, real_tokens
         for name, value in saved.items():
@@ -321,6 +333,10 @@ def cron_checks(entry, package: str) -> dict:
     return {
         "cron home channel must be a target": [enablement["home_channel"]["chat_id"] == "doc", repr(enablement)],
         "no home channel unless named": [bare is None, repr(bare)],
+        "gateway enables the platform without a home channel": [
+            unnamed is not None and unnamed.enabled and unnamed.home_channel is None, repr(unnamed)],
+        "a named home channel reaches the gateway": [
+            named is not None and named.home_channel is not None and named.home_channel.chat_id == "doc", repr(named)],
         "cron outside the gateway refuses attachments": [
             str(media.get("error", "")).startswith("gemini-voice: files") and not media.get("success"), repr(media)],
         "cron outside the gateway writes a new document": [

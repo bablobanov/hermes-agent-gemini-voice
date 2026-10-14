@@ -46,7 +46,7 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
 ## Requirements
 
 - Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
-  Tested live on 0.21.6; the engine contract test (52 checks) passes on 0.21.6 and 0.22.0
+  Tested live on 0.21.6; the engine contract test (54 checks) passes on 0.21.6 and 0.22.0
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
   and Google Sheets APIs** enabled and an **OAuth client of type "Desktop app"**
@@ -125,11 +125,13 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 
 `gemini_voice:doc` creates a new document titled `[Hermes digest] <first line of the output>`; its text starts
 with the same line. `gemini_voice:event-HHMM` creates (or updates, on the same day) a 15-minute event at that
-local time. A bare `gemini_voice` goes to `GEMINI_VOICE_HOME_CHANNEL` (`doc` or `event-HHMM`; any other value
-falls back to `doc` with a warning) and is not delivered while it is unset. The variable makes that target the
-platform's home channel, and Hermes sends its own notices to home channels too: the "back online" message after a
-planned restart would become a new document (the shutdown notice is refused). Without it no gateway notice reaches
-your Google account. Output with attachments is refused, never half-delivered. The
+local time. A bare `gemini_voice` goes to the platform's home channel, which exists only when you name one:
+`GEMINI_VOICE_HOME_CHANNEL` (`doc` or `event-HHMM`; any other value falls back to `doc` with a warning) or a
+`home_channel` under `platforms.gemini_voice` in `config.yaml`. Without one a bare `gemini_voice` is not delivered,
+and Hermes's own notices to home channels never reach your Google account. With one, they land there too: the
+"back online" message after a planned restart and storage warnings become a new document or update the event,
+depending on the target; the shutdown notice is always refused. Output with attachments is refused, never
+half-delivered. The
 voice chat itself is not a delivery target. When you ask by voice for something later or on a schedule
 (*"every day at 8 send me …"*), Hermes is told to create the cron job with one of these two targets.
 

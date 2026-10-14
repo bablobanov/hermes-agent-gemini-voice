@@ -28,10 +28,10 @@
   match; replies are written as plain text and as plain-string cell values
 - Cron delivery targets `gemini_voice:doc` (the title and the first line carry a `[Hermes digest]` signature)
   and `gemini_voice:event-HHMM`; the platform hint tells Hermes to use them for anything scheduled by voice;
-  output with attachments is refused inside and outside the gateway; `GEMINI_VOICE_HOME_CHANNEL` (one of the
-  two targets, else `doc`) is the only home channel: without it the platform has none, so Hermes's own notices
-  (shutting down, back online) never become documents, and a shutdown notice sent to a named home channel is
-  refused
+  output with attachments is refused inside and outside the gateway; the platform has a home channel only when
+  one is named (`GEMINI_VOICE_HOME_CHANNEL`, one of the two targets, else `doc`, or `home_channel` in
+  `config.yaml`), so by default Hermes's own notices to home channels (shutting down, back online, storage
+  warnings) never become Google objects; a shutdown notice to a named home channel is refused
 - Unattended: a broken token is reported as `retrying / auth_failed` in the gateway status, without a browser
   flow and without stopping the gateway; one refused or unreachable API does not stop the others or the replies;
   Drive files created in the last 15 minutes are read on every poll and the rest of the window is walked over
