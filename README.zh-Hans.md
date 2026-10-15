@@ -41,7 +41,7 @@ Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 
 ## 前提条件
 
 - Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
-  引擎契约测试（60 项检查）在 0.21.6 和 0.22.0 上均通过
+  引擎契约测试（61 项检查）在 0.21.6 和 0.22.0 上均通过
 - 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
 - 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，

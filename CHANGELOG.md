@@ -34,7 +34,7 @@
   warnings) never become Google objects; a shutdown notice to a named home channel is refused; the cron
   scheduler's wrapper (`Cronjob Response: <name>`, the job id line and the "To stop or manage this job" line,
   `cron.wrap_response`) is removed when the text has exactly that shape with the same name at both ends and
-  reads that way in only one place, so the
+  reads that way in only one place (read in one linear pass), so the
   object is titled and read as the job's own output (an empty output gets the default `Digest <time>` title);
   any other text is delivered as it is
 - Unattended: a broken token is reported as `retrying / auth_failed` in the gateway status, without a browser

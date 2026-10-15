@@ -1,4 +1,6 @@
+import time
 import unittest
+from unittest import mock
 
 from _load import load
 
@@ -74,6 +76,22 @@ class CronWrapperTests(unittest.TestCase):
             for output in self.OUTPUTS:
                 with self.subTest(name=name, output=output):
                     self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(output, name)), output)
+
+    def test_many_id_lines_stay_linear(self):
+        # quadratic reading of 20 000 id lines (~0.5 MB) would take minutes; a linear one, milliseconds
+        noise = "".join(f"\n(job_id: {i})\n-------------\n\nline {i}" for i in range(20000))
+        for text in (cron_wrapped(noise), "Cronjob Response: x" + noise + '").'):
+            started = time.monotonic()
+            textutil.strip_cron_wrapper(text)
+            self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(noise)), noise)
+
+    def test_past_the_comparison_cap_the_text_is_left(self):
+        # the fake id line lines up with a footer copy (one comparison, names differ), the real one fits (two)
+        text = cron_wrapped("body", "A\n(job_id: fake)\n-------------\n\nTAIL" + textutil.CRON_FOOTER + "B")
+        self.assertEqual(textutil.strip_cron_wrapper(text), "body")
+        with mock.patch.object(textutil, "MAX_CRON_READINGS", 1):
+            self.assertEqual(textutil.strip_cron_wrapper(text), text)
 
     def test_empty_output_stays_empty(self):
         self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped("")), "")

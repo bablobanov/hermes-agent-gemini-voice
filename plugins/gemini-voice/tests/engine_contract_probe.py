@@ -390,12 +390,15 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
         loop = asyncio.new_event_loop()
         runner = threading.Thread(target=loop.run_forever, daemon=True)
 
-        def stop_loop() -> None:
+        stopped: list = []
+
+        def stop_loop() -> None:  # a loop still running after the wait is reported below, never closed
             if runner.is_alive():
                 loop.call_soon_threadsafe(loop.stop)
                 runner.join(5)
             if not runner.is_alive():
                 loop.close()
+                stopped.append(True)
 
         stack.callback(stop_loop)
         runner.start()
@@ -421,6 +424,7 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
             and sent.startswith(textutil.CRON_HEADER) and secret not in sent, f"{live!r} {stub.outputs!r}"],
         "real cron run, live lane: strip gives the redacted output back exactly": [
             textutil.strip_cron_wrapper(sent) == expected, repr(sent)],
+        "real cron run, live lane: the loop stopped and closed": [stopped == [True], repr(stopped)],
     }
 
 

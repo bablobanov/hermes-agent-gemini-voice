@@ -120,6 +120,7 @@ CRON_HEADER = "Cronjob Response: "
 CRON_JOB_ID = "\n(job_id: "
 CRON_DIVIDER = "\n-------------\n\n"
 CRON_FOOTER = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+MAX_CRON_READINGS = 8  # name comparisons per text; the real wrapper needs one
 
 
 def strip_cron_wrapper(content: str) -> str:
@@ -128,19 +129,24 @@ def strip_cron_wrapper(content: str) -> str:
     with the same name in the header and the footer and a one-line id. Every id line is tried as the end of the
     name; only a single fitting reading is used, two or more leave the text as it is. An empty output stays
     empty. A text imitating the whole shape is read the same way: the format carries no key."""
-    if not content.startswith(CRON_HEADER):
+    if not content.startswith(CRON_HEADER) or not content.endswith('").'):
         return content
-    readings = []
+    tail, compared, readings = len(content) - 3, 0, []  # the name in the footer ends at ``tail``
     id_at = content.find(CRON_JOB_ID)
-    while id_at >= 0:
-        id_end = content.find(")" + CRON_DIVIDER, id_at + 1)
-        name = content[len(CRON_HEADER):id_at]
-        start, footer = id_end + 1 + len(CRON_DIVIDER), CRON_FOOTER + name + '").'
-        if (id_end >= 0 and "\n" not in content[id_at + len(CRON_JOB_ID):id_end] and content.endswith(footer)
-                and len(content) - len(footer) >= start):
-            readings.append(content[start:len(content) - len(footer)])
-        id_at = content.find(CRON_JOB_ID, id_at + 1)
-    return readings[0] if len(readings) == 1 else content
+    while id_at >= 0:  # one pass: each id line is read up to its own line end only
+        line_end = content.find("\n", id_at + len(CRON_JOB_ID))
+        size = id_at - len(CRON_HEADER)  # the name's length if this id line ends it
+        footer_at = tail - size - len(CRON_FOOTER)
+        start = line_end + len(CRON_DIVIDER)
+        if (line_end > 0 and content[line_end - 1] == ")" and content.startswith(CRON_DIVIDER, line_end)
+                and start <= footer_at and content.startswith(CRON_FOOTER, footer_at)):
+            compared += 1
+            if compared > MAX_CRON_READINGS:  # only a crafted text gets here: leave it as it is
+                return content
+            if content[len(CRON_HEADER):id_at] == content[tail - size:tail]:
+                readings.append((start, footer_at))
+        id_at = content.find(CRON_JOB_ID, max(id_at + 1, line_end))
+    return content[readings[0][0]:readings[0][1]] if len(readings) == 1 else content
 
 
 def plain_text(content: Optional[str]) -> str:
