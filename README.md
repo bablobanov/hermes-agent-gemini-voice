@@ -91,6 +91,11 @@ Earlier Gemini app versions (14-15 October 2026):
 - a morning briefing delivered by cron into an 08:00 event
 - a gateway restart leaves no stray document behind
 
+One object, one session (0.1.3, 15 October 2026): two document tasks dictated in a row ran as two Hermes
+sessions, `...:dm:owner:doc.<first id>` and `...:dm:owner:doc.<second id>`, and both system prompts held the
+`AGENTS.md` changed that day, which the shared conversation of 0.1.2 never saw; both answers landed in their
+documents.
+
 Covered by the unit tests and the engine contract test, not yet live: objects from other accounts are ignored,
 approvals, exactly once across a restart, a revoked token, a schedule set by voice.
 
