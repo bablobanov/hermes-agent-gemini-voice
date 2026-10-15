@@ -4,8 +4,15 @@
 
 [简体中文](README.zh-Hans.md) · [Русский](README.ru.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 
-Talk to your Hermes Agent from the **Gemini app on your Android phone**: while walking, while driving, without
-opening a chat. Say *"Create a document Hermes flights and put the text in it: compare the three cheapest
+**On Android you give your Hermes Agent a task without opening Telegram or any other messenger.** Call Gemini
+with its button (hold the power button, or use the assistant gesture) and say the task, even from the lock
+screen. Hermes writes the answer into the same Google object, and Gemini reads it aloud when you ask.
+
+- no messenger to open and no unlocking
+- one sentence by voice
+- the answer is read aloud
+
+Say *"Create a document Hermes flights and put the text in it: compare the three cheapest
 flights to Berlin on Friday"*. Hermes picks the document up, does the work with its usual tools and skills, and writes the
 answer into the same document. Later you ask Gemini *"Read the document Hermes flights"* and listen to it.
 

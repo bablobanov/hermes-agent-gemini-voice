@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- The descriptions lead with what the plugin is for: on Android you give Hermes a task without opening a
+  messenger, by calling Gemini with its button (hold the power button, or the assistant gesture), even from the
+  lock screen; one sentence by voice, the answer read aloud. README (en, ru, zh-Hans) and `plugin.yaml`
+
 ## 0.1.1
 
 - The plugin description recommends the document form that works on Gemini 4 Argon, *"create a document

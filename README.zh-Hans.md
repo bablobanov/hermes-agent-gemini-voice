@@ -4,7 +4,14 @@
 
 [English](README.md) · [Русский](README.ru.md) · [安全](SECURITY.md) · [更新日志](CHANGELOG.md)
 
-通过 **Android 手机上的 Gemini 应用**与你的 Hermes Agent 对话：走路时、开车时，无需打开聊天窗口。对 Gemini 说
+**在 Android 上，无需打开 Telegram 或其他即时通讯应用，就能给 Hermes Agent 布置任务。** 用按键唤起 Gemini（长按电源键，
+或使用助理手势），即使在锁屏状态下也能用语音说出任务。Hermes 把答案写回同一个 Google 对象，你要求时 Gemini 会朗读出来。
+
+- 无需打开即时通讯应用，也无需解锁
+- 一句话语音下达
+- 答案朗读给你听
+
+对 Gemini 说
 *“新建文档 Hermes 航班，并在里面写入文字：比较一下周五飞柏林最便宜的三个航班”*。Hermes 会发现这个文档，用它平常的工具和技能完成任务，
 并把答案写回同一个文档。之后你对 Gemini 说 *“读一下文档 Hermes 航班”*，就能听到结果。
 
