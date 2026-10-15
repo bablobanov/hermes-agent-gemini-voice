@@ -112,6 +112,26 @@ def _unforge(text: str) -> str:
     return text
 
 
+# The cron scheduler wraps job output for chat (cron/scheduler_delivery.py, ``cron.wrap_response``, on by
+# default); Hermes's own Yuanbao adapter strips the same shape. Read aloud it would become the event title
+# ("Cronjob Response: …"), a job id and an English "To stop or manage this job" line. The engine contract
+# test runs the real scheduler, so a changed shape fails there instead of reaching a document.
+CRON_HEADER = "Cronjob Response: "
+CRON_JOB_ID = "\n(job_id: "
+CRON_DIVIDER = "\n-------------\n\n"
+CRON_FOOTER = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+
+
+def strip_cron_wrapper(content: str) -> str:
+    """The job output inside the scheduler's header and footer; ``content`` unchanged if the shape differs."""
+    if not content.startswith(CRON_HEADER):
+        return content
+    divider, footer = content.find(CRON_DIVIDER), content.rfind(CRON_FOOTER)
+    if divider < 0 or footer <= divider or CRON_JOB_ID not in content[:divider] or not content.endswith('").'):
+        return content
+    return content[divider + len(CRON_DIVIDER):footer].strip() or content
+
+
 def plain_text(content: Optional[str]) -> str:
     """Markdown rendered as plain text for a speech reader; our markers cannot be forged by the agent."""
     text = _unforge((content or "").replace("\r\n", "\n"))

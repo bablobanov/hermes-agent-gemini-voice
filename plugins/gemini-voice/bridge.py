@@ -715,7 +715,8 @@ class VoiceBridge:
             return False, f"unknown target {target!r}: use 'doc' or 'event-HHMM'"
         async with self._lock:
             now = self._clock()
-            title, body = split_title(textutil.plain_text(content), f"Digest {self._local(now)}")
+            text = textutil.plain_text(textutil.strip_cron_wrapper(content))
+            title, body = split_title(text, f"Digest {self._local(now)}")
             try:
                 if slot:
                     event_id, status = await self._run(self.calendar_output.upsert, slot.group(1) + slot.group(2),

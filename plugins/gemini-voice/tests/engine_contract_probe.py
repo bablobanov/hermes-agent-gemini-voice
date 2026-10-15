@@ -347,6 +347,42 @@ def cron_checks(entry, package: str) -> dict:
     }
 
 
+def cron_wrapper_checks(package: str) -> dict:
+    """The real scheduler wraps the job output (``cron.wrap_response`` on by default); the plugin must get the
+    output back exactly. The text is captured where the scheduler hands it to the send lanes."""
+    from importlib import import_module
+    import cron.scheduler_delivery as delivery
+    from gateway.platforms.base import BasePlatformAdapter
+    textutil = import_module(package + ".textutil")
+
+    class Captured(Exception):
+        pass
+
+    seen: list = []
+    real_targets, real_extract = delivery._resolve_delivery_targets, BasePlatformAdapter.__dict__["extract_media"]
+
+    def capture(content, *args, **kwargs):
+        seen.append(content)
+        raise Captured()
+
+    output = "Briefing\n\nmail: 3 letters\nTo stop or manage this job, send me a new message (e.g. \"x\"). Quoted"
+    delivery._resolve_delivery_targets = lambda job, **_: [{"platform": "gemini_voice", "chat_id": "event-0800"}]
+    BasePlatformAdapter.extract_media = staticmethod(capture)
+    try:
+        delivery._deliver_result({"id": "job1", "name": "Briefing job", "deliver": "gemini_voice:event-0800"},
+                                 output)
+    except Captured:
+        pass
+    finally:
+        delivery._resolve_delivery_targets = real_targets
+        BasePlatformAdapter.extract_media = real_extract
+    wrapped = seen[0] if seen else ""
+    return {
+        "real cron wrapper is applied by default": [wrapped.startswith(textutil.CRON_HEADER), repr(wrapped[:80])],
+        "real cron wrapper is removed exactly": [textutil.strip_cron_wrapper(wrapped) == output, repr(wrapped)],
+    }
+
+
 def busy_checks(adapter) -> dict:
     """When the voice queue must wait: the restore gate and a live turn; a guard left by a dead turn not."""
     from types import SimpleNamespace
@@ -428,6 +464,7 @@ def probe() -> dict:
     results.update(ledger_checks(entry.adapter_factory, type(adapter).__module__.rsplit(".", 1)[0],
                                  Path(os.environ["HERMES_HOME"])))
     results.update(cron_checks(entry, type(adapter).__module__.rsplit(".", 1)[0]))
+    results.update(cron_wrapper_checks(type(adapter).__module__.rsplit(".", 1)[0]))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

@@ -31,7 +31,9 @@
   output with attachments is refused inside and outside the gateway; the platform has a home channel only when
   one is named (`GEMINI_VOICE_HOME_CHANNEL`, one of the two targets, else `doc`, or `home_channel` in
   `config.yaml`), so by default Hermes's own notices to home channels (shutting down, back online, storage
-  warnings) never become Google objects; a shutdown notice to a named home channel is refused
+  warnings) never become Google objects; a shutdown notice to a named home channel is refused; the cron
+  scheduler's wrapper (`Cronjob Response: …`, the job id and the "To stop or manage this job" line) is removed,
+  so the object is titled and read as the job's own output
 - Unattended: a broken token is reported as `retrying / auth_failed` in the gateway status, without a browser
   flow and without stopping the gateway; one refused or unreachable API does not stop the others or the replies;
   Drive files created in the last 15 minutes are read on every poll and the rest of the window is walked over

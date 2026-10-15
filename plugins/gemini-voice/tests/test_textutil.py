@@ -46,6 +46,34 @@ class BlockTests(unittest.TestCase):
         self.assertFalse(textutil.is_output(""))
 
 
+def cron_wrapped(output: str, name: str = "Брифинг голосом", job_id: str = "3e948ff561a2") -> str:
+    """The scheduler's wrapper, as cron/scheduler_delivery.py builds it (0.21.6 and 0.22.0)."""
+    return (f"Cronjob Response: {name}\n(job_id: {job_id})\n-------------\n\n{output}\n\n"
+            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {name}\").")
+
+
+class CronWrapperTests(unittest.TestCase):
+    def test_wrapper_is_removed(self):
+        output = "Брифинг\n\nИлья, сегодня 15 октября.\nВстреч нет."
+        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(output)), output)
+
+    def test_output_that_quotes_the_footer_keeps_it(self):
+        inner = 'Note\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder X"). Then more'
+        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(inner)), inner)
+
+    def test_other_shapes_stay_unchanged(self):
+        for text in ("Брифинг\nпочта: 3 письма",
+                     "Cronjob Response: x\n-------------\n\nbody",  # no job id, no footer
+                     "Cronjob Response: x\n(job_id: 1)\n-------------\n\nbody",  # no footer
+                     cron_wrapped("body") + "\nextra",  # something after the footer
+                     "Intro\n" + cron_wrapped("body")):  # the header not at the start
+            self.assertEqual(textutil.strip_cron_wrapper(text), text, text)
+
+    def test_empty_output_keeps_the_wrapper(self):
+        wrapped = cron_wrapped("")
+        self.assertEqual(textutil.strip_cron_wrapper(wrapped), wrapped)
+
+
 class PlainTextTests(unittest.TestCase):
     def test_markdown_becomes_listenable_text(self):
         source = "# Title\n**Bold** and *italic* and `code`\n* item\n> quote\n[site](https://x.org)\n```py\nprint()\n```"

@@ -1028,6 +1028,21 @@ class OutputTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(ok)
             self.assertIn("unknown target", error)
 
+    async def test_cron_wrapper_never_reaches_the_object(self):
+        h = Harness(timezone="UTC")
+        await h.bridge.tick()
+        wrapped = ("Cronjob Response: Брифинг голосом\n(job_id: 3e948ff561a2)\n-------------\n\n"
+                   "Брифинг\n\nИлья, встреч нет.\n\n"
+                   "To stop or manage this job, send me a new message (e.g. \"stop reminder Брифинг голосом\").")
+        ok, ref = await h.bridge.deliver_output("event-0800", wrapped)
+        self.assertTrue(ok)
+        event = h.fake.events[ref.split(".", 1)[1]]
+        self.assertEqual(event["summary"], "Брифинг")
+        self.assertEqual(event["description"], "Илья, встреч нет.")
+        ok, ref = await h.bridge.deliver_output("doc", wrapped.replace("Брифинг\n\n", "Радар\n\n", 1))
+        doc_id = ref.split(".", 1)[1]
+        self.assertEqual(h.fake.doc_text(doc_id), "[Hermes digest] Радар\nИлья, встреч нет.\n")
+
     async def test_own_output_is_never_a_task_even_without_the_journal(self):
         h = Harness()
         await h.bridge.tick()
