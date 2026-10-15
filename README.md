@@ -75,7 +75,7 @@ Gemini 4 Argon (15 October 2026), dictated in Russian in the chat mode:
 - *"Read the document Hermes - capital of Africa"* in Gemini Live: Gemini found both documents and read the
   answers aloud
 
-Earlier Gemini app versions (13-15 October 2026):
+Earlier Gemini app versions (14-15 October 2026):
 
 - a document task: Hermes answered in the document, Gemini read the answer aloud
 - an event task: Hermes answered in the event description

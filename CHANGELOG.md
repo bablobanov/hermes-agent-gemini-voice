@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- The plugin description recommends the document form that works on Gemini 4 Argon, *"create a document
+  Hermes ... and put the text in it: ..."*; the shorter *"... with the text: ..."* gives Argon only the title.
+  Same as the README and the catalog entry
+- README: the live probes of the plugin ran on 14-15 October 2026 (not 13-15: 13 October was a proof of
+  concept without the plugin)
+
 ## 0.1.0
 
 - First release: the `gemini_voice` gateway platform. New Google Calendar events, Docs and Sheets with a label
