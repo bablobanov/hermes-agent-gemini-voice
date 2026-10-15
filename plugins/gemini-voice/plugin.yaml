@@ -3,9 +3,9 @@ label: Gemini Voice
 kind: platform
 version: 0.1.0
 description: >
-  Voice tasks from the Gemini app on your phone: say "create a document: Hermes, ..." (or an event, or a
-  sheet), Hermes does the task and writes the reply into that same Google object, and Gemini reads it
-  aloud. Uses the plugin's own Google OAuth token and only objects the account owner created.
+  Voice tasks from the Gemini app on your phone: say "create a document Hermes ... with the text: ..." (or an
+  event, or a sheet), Hermes does the task and writes the reply into that same Google object, and Gemini reads
+  it aloud. Uses the plugin's own Google OAuth token and only objects the account owner created.
 author: Ilya Balobanov
 license: MIT
 homepage: https://github.com/bablobanov/hermes-agent-gemini-voice
