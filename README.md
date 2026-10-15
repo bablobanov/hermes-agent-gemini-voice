@@ -1,16 +1,19 @@
 # Hermes Agent Gemini Voice
 
-![Hermes Agent Gemini Voice: talk to your Hermes Agent from an Android phone with Gemini Live](assets/hermes-agent-gemini-live-voice-android.svg)
+![Hermes Agent Gemini Voice: talk to your Hermes Agent from an Android phone with Gemini Live on Gemini 4 Argon](assets/hermes-agent-gemini-live-voice-android-argon.svg)
 
 [简体中文](README.zh-Hans.md) · [Русский](README.ru.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 
 Talk to your Hermes Agent from the **Gemini app on your Android phone**: while walking, while driving, without
-opening a chat. Say *"Create a document: Hermes, compare the three cheapest flights to Berlin on Friday"*.
-Hermes picks the document up, does the work with its usual tools and skills, and writes the answer into the
-same document. Later you ask Gemini *"Read the document Hermes flights"* and listen to it.
+opening a chat. Say *"Create a document Hermes flights and put the text in it: compare the three cheapest
+flights to Berlin on Friday"*. Hermes picks the document up, does the work with its usual tools and skills, and writes the
+answer into the same document. Later you ask Gemini *"Read the document Hermes flights"* and listen to it.
 
 No new app, no Gemini API key, no public endpoint: the channel is your own Google Calendar, Docs and Sheets.
 Hermes reads them through the plugin's own Google OAuth token and the Gemini app reads them aloud.
+
+Supports **Gemini 4 Argon** and works with earlier Gemini app versions. The plugin is not tied to a model: it
+sees only the Google objects the app creates.
 
 ```text
 Gemini app ──creates──► event / doc / sheet with "Hermes" in the title (your account)
@@ -36,17 +39,58 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
 
 ### How the Gemini app behaves (tested by the author, October 2026)
 
-- One task = one new object, said in one sentence: *"Create a document Hermes … with the text …"*,
-  *"Create an event tomorrow at 10: Hermes …"*, *"Create a sheet Hermes shopping: milk, bread, cheese"*
+- One task = one new object, said in one sentence. Gemini does what sounds addressed to Gemini itself, so name
+  the content explicitly:
+  - document: say what goes into it, *"Create a document Hermes flights and put the text in it: compare the
+    three cheapest flights to Berlin"*. Otherwise Gemini answers the request itself and the document gets only
+    its title. Earlier Gemini app versions also took the shorter *"… with the text: …"*; on Gemini 4 Argon it
+    gave only the title
+  - event: put the task in the title as a name, not as a request, *"Create an event in Google Calendar today in
+    an hour titled Hermes product of 17 and 23"*. Gemini does not carry a spoken description over into the
+    event, and a request in the title (*"Hermes, multiply 17 by 23"*) it answers itself, leaving the title
+    *"Hermes"*. Naming Google Calendar saves the question which calendar to use on phones that have their own
+  - sheet: the same, title and rows named, *"Create a spreadsheet in Google Sheets titled Hermes shopping with
+    the rows milk, bread, cheese"*. Hermes answers in the rows below
+- Pick a label that speech recognition writes reliably. A short nickname can come out as other words (a Russian
+  "Афоня" became "о фоне", "about the background"), and then the object is not a task; a full name worked
 - Gemini cannot edit an existing document or add a row to an existing sheet, so the conversation continues
   with new objects
 - Gemini does not announce that the reply is ready; you ask for it when you want it. For events the natural
-  question works: *"What's on my calendar tomorrow at 10?"*
+  question works: *"What's on my calendar tomorrow at 10?"*. Asking by time is safer than by title: speech
+  recognition may write the label in another alphabet (a Russian "Гермес" came out as "Hermes") and the title
+  search is literal
+
+### Tested live (Hermes 0.21.6, October 2026)
+
+With the Gemini app on an Android phone.
+
+Gemini 4 Argon (15 October 2026), dictated in Russian in the chat mode:
+
+- *"Create a document Hermes capitals of Africa with the text: name three capitals of Africa"*: the document got
+  only its title, *"Hermes - capital of Africa"*; the plugin took it and Hermes answered from the title (Africa is a
+  continent with no single capital, for example Cairo, Nairobi, Addis Ababa)
+- *"Create a document Hermes capitals of Africa and put the text in it: name three capitals of Africa"*: the
+  document got the title and the text (speech recognition wrote "three" as "300"); the plugin took it and Hermes
+  named three capitals
+- *"Read the document Hermes - capital of Africa"* in Gemini Live: Gemini found both documents and read the
+  answers aloud
+
+Earlier Gemini app versions (13-15 October 2026):
+
+- a document task: Hermes answered in the document, Gemini read the answer aloud
+- an event task: Hermes answered in the event description
+- a sheet task: Hermes answered in the rows below, Gemini read them
+- a morning briefing delivered by cron into an 08:00 event
+- a gateway restart leaves no stray document behind
+
+Covered by the unit tests and the engine contract test, not yet live: objects from other accounts are ignored,
+approvals, exactly once across a restart, a revoked token, a schedule set by voice.
 
 ## Requirements
 
 - Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
-  Tested live on 0.21.6; the engine contract test (61 checks) passes on 0.21.6 and 0.22.0
+  Tested live on 0.21.6; the engine contract test (61 checks) passes on 0.21.6 and 0.22.0. Hermes does not load
+  platform plugins under `plugins.isolation: host`, so this plugin does not work in that mode
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
   and Google Sheets APIs** enabled and an **OAuth client of type "Desktop app"**
@@ -106,15 +150,22 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
    (`platform_toolsets.gemini_voice`, default `hermes-gemini_voice`). Give it the same tools as your main
    chat if you want the same abilities by voice.
 
+   If you turned on the runtime footer (`display.runtime_footer`, off by default), turn it off for this
+   platform. Otherwise the footer line (`model · 4%`) lands in every reply and Gemini reads it aloud:
+
+   ```sh
+   hermes config set display.platforms.gemini_voice.runtime_footer.enabled false
+   ```
+
 ## Using it
 
 | Say to Gemini | What happens |
 |---|---|
-| "Create a document: Hermes, draft a reply to the landlord about the heating" | Hermes drafts it into the document |
-| "Create an event tomorrow at 9: Hermes, what do I need for the passport office" | the answer lands in the event description |
-| "Create a sheet Hermes expenses: fuel 3000" | Hermes handles it and answers in the next rows |
+| "Create a document Hermes landlord and put the text in it: draft a reply to the landlord about the heating" | Hermes drafts it into the document |
+| "Create an event in Google Calendar tomorrow at 9 titled Hermes documents for the passport office" | the answer lands in the event description |
+| "Create a spreadsheet in Google Sheets titled Hermes expenses with the rows fuel 3000, parking 400" | Hermes handles it and answers in the next rows |
 | "Read the document Hermes landlord" / "What's on my calendar tomorrow at 9?" | Gemini reads the reply |
-| "Create a document: Hermes, yes, send it" | answers a question Hermes asked in its previous reply |
+| "Create a document Hermes landlord reply and put the text in it: yes, send it" | answers a question Hermes asked in its previous reply |
 
 Deliver a cron job's output by voice-friendly target:
 

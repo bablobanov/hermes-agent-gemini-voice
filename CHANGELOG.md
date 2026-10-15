@@ -5,6 +5,7 @@
 - First release: the `gemini_voice` gateway platform. New Google Calendar events, Docs and Sheets with a label
   in the title, created by the account owner, become tasks for Hermes; the final reply replaces the
   plugin's acknowledgement in the same object for the Gemini app to read aloud
+- Supports Gemini 4 Argon and works with earlier Gemini app versions
 - The plugin's own OAuth token (`calendar.events.owned`, `drive.metadata.readonly`, `documents`,
   `spreadsheets`), refreshed in memory only; `hermes gemini-voice auth | check | status`
 - Owner-only boundary: invitations, shared files, events added or edited by other people, recurring events and

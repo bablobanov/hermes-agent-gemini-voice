@@ -1,15 +1,18 @@
 # Hermes Agent Gemini Voice
 
-![Hermes Agent Gemini Voice：通过 Gemini Live 在 Android 手机上与你的 Hermes Agent 对话](assets/hermes-agent-gemini-live-voice-android.svg)
+![Hermes Agent Gemini Voice：通过 Gemini 4 Argon 上的 Gemini Live 在 Android 手机上与你的 Hermes Agent 对话](assets/hermes-agent-gemini-live-voice-android-argon.svg)
 
 [English](README.md) · [Русский](README.ru.md) · [安全](SECURITY.md) · [更新日志](CHANGELOG.md)
 
 通过 **Android 手机上的 Gemini 应用**与你的 Hermes Agent 对话：走路时、开车时，无需打开聊天窗口。对 Gemini 说
-*“新建文档：Hermes，比较一下周五飞柏林最便宜的三个航班”*。Hermes 会发现这个文档，用它平常的工具和技能完成任务，
+*“新建文档 Hermes 航班，并在里面写入文字：比较一下周五飞柏林最便宜的三个航班”*。Hermes 会发现这个文档，用它平常的工具和技能完成任务，
 并把答案写回同一个文档。之后你对 Gemini 说 *“读一下文档 Hermes 航班”*，就能听到结果。
 
 不需要新应用、不需要 Gemini API 密钥、不需要公网端点：通道就是你自己的 Google 日历、文档和表格。Hermes 通过插件
 自己的 Google OAuth 令牌读取它们，Gemini 应用负责朗读。
+
+支持 **Gemini 4 Argon**，也适用于更早版本的 Gemini 应用。插件不绑定任何模型：它只看 Gemini 应用创建的
+Google 对象。
 
 ```text
 Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 / 表格（你的账号）
@@ -33,15 +36,47 @@ Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 
 
 ### Gemini 应用的行为（作者实测，2026 年 10 月）
 
-- 一个任务 = 一个新对象，一句话说完：*“新建文档 Hermes …，内容是 …”*、*“明天 10 点新建事件：Hermes …”*、
-  *“新建表格 Hermes 购物：牛奶、面包、奶酪”*
+- 一个任务 = 一个新对象，一句话说完。听起来像是对 Gemini 本身的请求，它会自己执行，所以要明确说出内容：
+  - 文档：说清楚要放进去什么：*“新建文档 Hermes 航班，并在里面写入文字：比较一下飞柏林最便宜的三个航班”*。否则 Gemini
+    会自己回答，文档只有标题。更早版本的 Gemini 应用也接受较短的 *“……，内容是：……”*；在 Gemini 4 Argon 上它只生成了标题
+  - 事件：把任务作为名称放进标题，而不是作为请求：*“在 Google 日历里新建一个一小时后的事件，标题是 Hermes 17 和 23
+    的乘积”*。口述的描述 Gemini 不会写进事件；标题里的请求（*“Hermes，17 乘以 23”*）它会自己回答，只留下标题
+    *“Hermes”*。说出“Google 日历”，在自带日历应用的手机上可以省去“用哪个日历”的追问
+  - 表格：同样说出标题和各行：*“在 Google 表格里新建表格，标题是 Hermes 购物，各行是牛奶、面包、奶酪”*。Hermes
+    在下面几行回复
+- 选择语音识别能稳定写对的标签。简短的昵称可能被识别成别的词（俄语的“Афоня”变成了“о фоне”），对象就不会成为
+  任务；用完整的名字则可以
 - Gemini 不能编辑已有文档，也不能往已有表格里加行，所以对话通过新对象继续
-- Gemini 不会主动通知回复已就绪，需要时你自己去问。日历事件可以用自然的问法：*“我明天 10 点有什么安排？”*
+- Gemini 不会主动通知回复已就绪，需要时你自己去问。日历事件可以用自然的问法：*“我明天 10 点有什么安排？”*。按时间问比按标题
+  问更可靠：语音识别可能用另一种文字写出标签（俄语的“Гермес”被写成了“Hermes”），而标题搜索是逐字匹配的
+
+### 实测（Hermes 0.21.6，2026 年 10 月）
+
+在 Android 手机上的 Gemini 应用中。
+
+Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语口述：
+
+- *“新建文档 Hermes 非洲首都，内容是：说出非洲的三个首都”*：文档只有标题 *“Hermes - 非洲首都”*；插件接手后，Hermes
+  根据标题作答（非洲是大洲，没有统一的首都，例如开罗、内罗毕、亚的斯亚贝巴）
+- *“新建文档 Hermes 非洲首都，并在里面写入文字：说出非洲的三个首都”*：文档有了标题和文字（语音识别把“三”写成了
+  “300”）；插件接手后，Hermes 说出了三个首都
+- 在 Gemini Live 中说 *“读一下文档 Hermes - 非洲首都”*：Gemini 找到了两个文档并朗读了答案
+
+更早版本的 Gemini 应用（2026 年 10 月 13-15 日）：
+
+- 文档任务：Hermes 在文档中作答，Gemini 朗读了答案
+- 日历事件任务：Hermes 在事件描述中作答
+- 表格任务：Hermes 在下面几行作答，Gemini 朗读了它们
+- 通过 cron 把晨间简报投递到 08:00 的事件
+- 网关重启不会留下多余的文档
+
+已由单元测试和引擎契约测试覆盖、尚未实测：忽略其他账号的对象、审批、重启后恰好一次、被撤销的令牌、用语音设定的定时任务。
 
 ## 前提条件
 
 - Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
-  引擎契约测试（61 项检查）在 0.21.6 和 0.22.0 上均通过
+  引擎契约测试（61 项检查）在 0.21.6 和 0.22.0 上均通过。`plugins.isolation: host` 模式下 Hermes 不加载平台插件，
+  因此本插件在该模式下不可用
 - 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
 - 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，
@@ -98,15 +133,22 @@ Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 
    语音任务使用该平台的工具集，配置方式与其他平台相同（`platform_toolsets.gemini_voice`，默认
    `hermes-gemini_voice`）。如果希望语音拥有与主聊天相同的能力，就给它配置相同的工具。
 
+   如果你开启了运行信息页脚（`display.runtime_footer`，默认关闭），请为本平台关闭它，否则每条回复都会带上
+   `模型 · 4%` 这一行，Gemini 会把它读出来：
+
+   ```sh
+   hermes config set display.platforms.gemini_voice.runtime_footer.enabled false
+   ```
+
 ## 使用
 
 | 对 Gemini 说 | 结果 |
 |---|---|
-| “新建文档：Hermes，帮我起草一封给房东的暖气问题回复” | Hermes 把草稿写进该文档 |
-| “明天 9 点新建事件：Hermes，去护照办公室要带什么” | 答案写进事件描述 |
-| “新建表格 Hermes 开销：油费 3000” | Hermes 处理后在下面几行回复 |
+| “新建文档 Hermes 房东，并在里面写入文字：帮我起草一封给房东的暖气问题回复” | Hermes 把草稿写进该文档 |
+| “在 Google 日历里新建明天 9 点的事件，标题是 Hermes 护照办公室所需材料” | 答案写进事件描述 |
+| “在 Google 表格里新建表格，标题是 Hermes 开销，各行是油费 3000、停车费 400” | Hermes 处理后在下面几行回复 |
 | “读一下文档 Hermes 房东” / “我明天 9 点有什么安排？” | Gemini 朗读回复 |
-| “新建文档：Hermes，可以，发出去吧” | 回答 Hermes 在上一条回复中提出的问题 |
+| “新建文档 Hermes 房东回复，并在里面写入文字：可以，发出去吧” | 回答 Hermes 在上一条回复中提出的问题 |
 
 把定时任务的输出投递到适合语音收听的目标：
 
