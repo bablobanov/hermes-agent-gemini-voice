@@ -123,13 +123,20 @@ CRON_FOOTER = '\n\nTo stop or manage this job, send me a new message (e.g. "stop
 
 
 def strip_cron_wrapper(content: str) -> str:
-    """The job output inside the scheduler's header and footer; ``content`` unchanged if the shape differs."""
+    """The job output inside the scheduler's wrapper, exactly; ``content`` unchanged unless it is precisely
+    ``Cronjob Response: <name>\\n(job_id: <id>)\\n-------------\\n\\n<output>\\n\\nTo stop … "stop reminder <name>").``
+    with the same name in the header and the footer and a one-line id. An empty output stays empty."""
     if not content.startswith(CRON_HEADER):
         return content
-    divider, footer = content.find(CRON_DIVIDER), content.rfind(CRON_FOOTER)
-    if divider < 0 or footer <= divider or CRON_JOB_ID not in content[:divider] or not content.endswith('").'):
+    id_at = content.find(CRON_JOB_ID)  # the name is everything before the first id line
+    id_end = content.find(")" + CRON_DIVIDER, id_at + 1)
+    if id_at < 0 or id_end < 0 or "\n" in content[id_at + len(CRON_JOB_ID):id_end]:
         return content
-    return content[divider + len(CRON_DIVIDER):footer].strip() or content
+    name = content[len(CRON_HEADER):id_at]
+    start, footer = id_end + 1 + len(CRON_DIVIDER), CRON_FOOTER + name + '").'
+    if not content.endswith(footer) or len(content) - len(footer) < start:
+        return content
+    return content[start:len(content) - len(footer)]
 
 
 def plain_text(content: Optional[str]) -> str:

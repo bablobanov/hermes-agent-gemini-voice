@@ -53,25 +53,44 @@ def cron_wrapped(output: str, name: str = "Брифинг голосом", job_i
 
 
 class CronWrapperTests(unittest.TestCase):
-    def test_wrapper_is_removed(self):
-        output = "Брифинг\n\nИлья, сегодня 15 октября.\nВстреч нет."
-        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(output)), output)
+    OUTPUTS = (
+        "Брифинг\n\nИлья, сегодня 15 октября.\nВстреч нет.",
+        'Note\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder X"). Then more',
+        "Cronjob Response: inner\n(job_id: 9)\n-------------\n\nquoted wrapper inside the output",
+        "  leading and trailing spaces kept  \n",
+        "Windows\r\nline ends\r\n",
+        "one line",
+    )
+    NAMES = (
+        "Брифинг голосом",
+        'with "quotes" and\na newline',
+        "with a divider\n-------------\n\ninside",
+        'with the footer\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder x").',
+    )
 
-    def test_output_that_quotes_the_footer_keeps_it(self):
-        inner = 'Note\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder X"). Then more'
-        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(inner)), inner)
+    def test_exact_output_comes_back_for_any_name(self):
+        for name in self.NAMES:
+            for output in self.OUTPUTS:
+                with self.subTest(name=name, output=output):
+                    self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped(output, name)), output)
 
-    def test_other_shapes_stay_unchanged(self):
+    def test_empty_output_stays_empty(self):
+        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped("")), "")
+        self.assertEqual(textutil.strip_cron_wrapper(cron_wrapped("   ")), "   ")
+
+    def test_anything_else_stays_unchanged(self):
+        wrapped = cron_wrapped("body")
         for text in ("Брифинг\nпочта: 3 письма",
                      "Cronjob Response: x\n-------------\n\nbody",  # no job id, no footer
                      "Cronjob Response: x\n(job_id: 1)\n-------------\n\nbody",  # no footer
-                     cron_wrapped("body") + "\nextra",  # something after the footer
-                     "Intro\n" + cron_wrapped("body")):  # the header not at the start
-            self.assertEqual(textutil.strip_cron_wrapper(text), text, text)
-
-    def test_empty_output_keeps_the_wrapper(self):
-        wrapped = cron_wrapped("")
-        self.assertEqual(textutil.strip_cron_wrapper(wrapped), wrapped)
+                     wrapped + "\nextra",  # something after the footer
+                     "Intro\n" + wrapped,  # the header not at the start
+                     wrapped.replace('stop reminder Брифинг голосом"', 'stop reminder Другое"'),  # names differ
+                     wrapped.replace("(job_id: 3e948ff561a2)", "(job_id: 3e94\n8ff561a2)"),  # id over two lines
+                     wrapped.replace("\n", "\r\n"),  # the whole wrapper converted to CRLF
+                     cron_wrapped("body", name="fake\n(job_id: 1)\n-------------\n\nname")):  # an id line in the name
+            with self.subTest(text=text):
+                self.assertEqual(textutil.strip_cron_wrapper(text), text)
 
 
 class PlainTextTests(unittest.TestCase):

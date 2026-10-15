@@ -347,39 +347,72 @@ def cron_checks(entry, package: str) -> dict:
     }
 
 
-def cron_wrapper_checks(package: str) -> dict:
-    """The real scheduler wraps the job output (``cron.wrap_response`` on by default); the plugin must get the
-    output back exactly. The text is captured where the scheduler hands it to the send lanes."""
+def cron_wrapper_checks(adapter, package: str) -> dict:
+    """The real scheduler end to end (``_deliver_result``: the wrapper of ``cron.wrap_response``, on by default,
+    media cleanup, secret redaction, target resolution and both send lanes); nothing in the engine is patched.
+    Standalone: the plugin's own sender writes to Google faked in memory. Live: the gateway's adapter on a
+    running loop hands the text to the bridge. The object must hold the job's output, not the wrapper."""
+    import threading
+    from contextlib import ExitStack
     from importlib import import_module
+    from unittest import mock
     import cron.scheduler_delivery as delivery
-    from gateway.platforms.base import BasePlatformAdapter
-    textutil = import_module(package + ".textutil")
+    from gateway.config import Platform
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fake_google import FakeGoogle
+    api, textutil, fake = import_module(package + ".google_api"), import_module(package + ".textutil"), FakeGoogle()
+    real_client, real_tokens = api.GoogleClient, api.TokenSource
+    secret = "ghp_" + "Ab3" * 12
+    output = ("Briefing\n\nmail: 3 letters, token " + secret + "\n"
+              'To stop or manage this job, send me a new message (e.g. "x"). Quoted by the job itself')
 
-    class Captured(Exception):
-        pass
+    def job(target: str) -> dict:
+        return {"id": "job1", "name": "Briefing job", "deliver": f"gemini_voice:{target}"}
 
-    seen: list = []
-    real_targets, real_extract = delivery._resolve_delivery_targets, BasePlatformAdapter.__dict__["extract_media"]
-
-    def capture(content, *args, **kwargs):
-        seen.append(content)
-        raise Captured()
-
-    output = "Briefing\n\nmail: 3 letters\nTo stop or manage this job, send me a new message (e.g. \"x\"). Quoted"
-    delivery._resolve_delivery_targets = lambda job, **_: [{"platform": "gemini_voice", "chat_id": "event-0800"}]
-    BasePlatformAdapter.extract_media = staticmethod(capture)
-    try:
-        delivery._deliver_result({"id": "job1", "name": "Briefing job", "deliver": "gemini_voice:event-0800"},
-                                 output)
-    except Captured:
-        pass
-    finally:
-        delivery._resolve_delivery_targets = real_targets
-        BasePlatformAdapter.extract_media = real_extract
-    wrapped = seen[0] if seen else ""
+    names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
+             "GEMINI_VOICE_REFRESH_TOKEN": "token"}
+    stub, previous = StubBridge(), adapter._bridge
+    loop = asyncio.new_event_loop()
+    runner = threading.Thread(target=loop.run_forever, daemon=True)
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.dict(os.environ, names))
+        os.environ.pop("GEMINI_VOICE_HOME_CHANNEL", None)  # restored with the rest when the stack closes
+        stack.enter_context(mock.patch.object(api, "GoogleClient",
+                                              lambda tokens, **_: real_client(tokens, transport=fake)))
+        stack.enter_context(mock.patch.object(api, "TokenSource", lambda *a, **_: real_tokens(*a, transport=fake)))
+        standalone_event = delivery._deliver_result(job("event-0800"), output)
+        standalone_doc = delivery._deliver_result(job("doc"), output)
+        runner.start()
+        stack.callback(loop.close)
+        stack.callback(runner.join, 5)
+        stack.callback(loop.call_soon_threadsafe, loop.stop)
+        stack.callback(setattr, adapter, "_bridge", previous)
+        adapter._bridge = stub
+        live = delivery._deliver_result(job("event-0800"), output,
+                                        adapters={Platform("gemini_voice"): adapter}, loop=loop)
+    events = list(fake.events.values())
+    docs = [doc_id for doc_id, doc in fake.docs.items() if doc.get("title")]
+    description = events[0].get("description", "") if len(events) == 1 else ""
+    doc_text = fake.doc_text(docs[0]) if len(docs) == 1 else ""
+    sent = stub.outputs[0][1] if len(stub.outputs) == 1 else ""
+    wrapper = ("Cronjob", "job_id", 'stop reminder Briefing job')
     return {
-        "real cron wrapper is applied by default": [wrapped.startswith(textutil.CRON_HEADER), repr(wrapped[:80])],
-        "real cron wrapper is removed exactly": [textutil.strip_cron_wrapper(wrapped) == output, repr(wrapped)],
+        "real cron run, standalone lane: event titled by the output": [
+            standalone_event is None and len(events) == 1 and events[0].get("summary") == "Briefing",
+            f"{standalone_event!r} {events!r}"],
+        "real cron run, standalone lane: event text without the wrapper": [
+            description.startswith("mail: 3 letters") and description.endswith("Quoted by the job itself")
+            and not any(w in description for w in wrapper) and secret not in description, repr(description)],
+        "real cron run, standalone lane: document without the wrapper": [
+            standalone_doc is None and doc_text.startswith("[Hermes digest] Briefing\nmail: 3 letters")
+            and not any(w in doc_text for w in wrapper) and secret not in doc_text, f"{standalone_doc!r} {doc_text!r}"],
+        "real cron run, live lane: the adapter gets the wrapped output": [
+            live is None and sent.startswith(textutil.CRON_HEADER) and stub.outputs[0][0] == "event-0800",
+            f"{live!r} {stub.outputs!r}"],
+        "real cron run, live lane: the wrapper comes off exactly": [
+            textutil.strip_cron_wrapper(sent).startswith("Briefing\n\nmail: 3 letters")
+            and textutil.strip_cron_wrapper(sent).endswith("Quoted by the job itself")
+            and not any(w in textutil.strip_cron_wrapper(sent) for w in wrapper), repr(sent)],
     }
 
 
@@ -464,7 +497,7 @@ def probe() -> dict:
     results.update(ledger_checks(entry.adapter_factory, type(adapter).__module__.rsplit(".", 1)[0],
                                  Path(os.environ["HERMES_HOME"])))
     results.update(cron_checks(entry, type(adapter).__module__.rsplit(".", 1)[0]))
-    results.update(cron_wrapper_checks(type(adapter).__module__.rsplit(".", 1)[0]))
+    results.update(cron_wrapper_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:

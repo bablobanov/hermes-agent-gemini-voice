@@ -46,7 +46,7 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
 ## Requirements
 
 - Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
-  Tested live on 0.21.6; the engine contract test (56 checks) passes on 0.21.6 and 0.22.0
+  Tested live on 0.21.6; the engine contract test (59 checks) passes on 0.21.6 and 0.22.0
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
   and Google Sheets APIs** enabled and an **OAuth client of type "Desktop app"**

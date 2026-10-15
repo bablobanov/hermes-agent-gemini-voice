@@ -1043,6 +1043,21 @@ class OutputTests(unittest.IsolatedAsyncioTestCase):
         doc_id = ref.split(".", 1)[1]
         self.assertEqual(h.fake.doc_text(doc_id), "[Hermes digest] Радар\nИлья, встреч нет.\n")
 
+    async def test_empty_cron_output_gets_the_default_title(self):
+        h = Harness(timezone="UTC")
+        await h.bridge.tick()
+        wrapped = ("Cronjob Response: Брифинг голосом\n(job_id: 3e948ff561a2)\n-------------\n\n  \n\n"
+                   "To stop or manage this job, send me a new message (e.g. \"stop reminder Брифинг голосом\").")
+        ok, ref = await h.bridge.deliver_output("event-0800", wrapped)
+        self.assertTrue(ok)
+        event = h.fake.events[ref.split(".", 1)[1]]
+        self.assertTrue(event["summary"].startswith("Digest "), event["summary"])
+        self.assertNotIn("job", event.get("description", ""))
+        ok, ref = await h.bridge.deliver_output("doc", wrapped)
+        doc_id = ref.split(".", 1)[1]
+        self.assertTrue(h.fake.docs[doc_id]["title"].startswith("[Hermes digest] Digest "), h.fake.docs[doc_id]["title"])
+        self.assertNotIn("Cronjob", h.fake.doc_text(doc_id))
+
     async def test_own_output_is_never_a_task_even_without_the_journal(self):
         h = Harness()
         await h.bridge.tick()
