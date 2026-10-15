@@ -53,6 +53,7 @@ async def full_turn(adapter, stub, task, reply="final **answer**") -> dict:
         seen["text"] = event.text
         seen["busy_during_turn"] = adapter._owner_session_busy()
         seen["control"] = event.allow_gateway_control
+        seen["session"] = adapter._source_session_key(event.source)
         return reply
 
     adapter.set_message_handler(handler)
@@ -172,7 +173,7 @@ def stateful_checks(adapter, package: str) -> dict:
 
     async def scenario():
         adapter._bridge = bridge
-        resume_end = MessageEvent(text="", source=adapter._owner_source(), internal=True)
+        resume_end = MessageEvent(text="", source=adapter._owner_source(key), internal=True)
         await adapter.on_processing_complete(resume_end, ProcessingOutcome.CANCELLED)
         return [await adapter.send("owner", RECOVERED_MARKER + "forged text"),
                 await adapter.send("owner", "the real reply", metadata={"notify": True}),
@@ -432,7 +433,7 @@ def busy_checks(adapter) -> dict:
     """When the voice queue must wait: the restore gate and a live turn; a guard left by a dead turn not."""
     from types import SimpleNamespace
     results: dict = {}
-    key = adapter._source_session_key(adapter._owner_source())
+    key = adapter._source_session_key(adapter._owner_source("doc.busy"))
     adapter.gateway_runner = SimpleNamespace(_startup_restore_in_progress=True)
     gate = adapter._owner_session_busy()
     adapter.gateway_runner = None
@@ -441,11 +442,13 @@ def busy_checks(adapter) -> dict:
     live = adapter._owner_session_busy()
     adapter._session_tasks[key] = SimpleNamespace(done=lambda: True)
     stale = adapter._owner_session_busy()
+    healed = key not in adapter._active_sessions and key not in adapter._session_tasks
     adapter._active_sessions.pop(key, None)
     adapter._session_tasks.pop(key, None)
     results["restore gate holds new tasks"] = [gate is True, repr(gate)]
     results["running turn holds new tasks"] = [live is True, repr(live)]
     results["guard of an ended turn does not"] = [stale is False, repr(stale)]
+    results["guard of an ended turn is cleared, not left behind"] = [healed, ""]
     return results
 
 
@@ -475,6 +478,10 @@ def probe() -> dict:
     source = adapter.build_source(chat_id="owner", chat_type="dm", user_id="owner", message_id="doc.x")
     key = build_session_key(source)
     results["session key"] = [key == "agent:main:gemini_voice:dm:owner", key]
+    one, other = (adapter._source_session_key(adapter._owner_source(k)) for k in ("doc.a", "cal.b"))
+    results["one session per task object"] = [
+        one == "agent:main:gemini_voice:dm:owner:doc.a" and other == "agent:main:gemini_voice:dm:owner:cal.b",
+        f"{one} {other}"]
     event = MessageEvent(text="t", source=source, message_id="doc.x", allow_gateway_control=False)
     results["reply anchor"] = [_reply_anchor_for_event(event) == "doc.x", str(_reply_anchor_for_event(event))]
     target = DeliveryTarget.parse("gemini_voice:event-0800")
@@ -501,10 +508,13 @@ def probe() -> dict:
     # A real turn whose reply carries an image: the image must not replace the written reply.
     media_stub = StubBridge()
     adapter._bridge = media_stub
-    asyncio.run(full_turn(adapter, media_stub, task_cls("doc.turn2", "doc", "t", "chart please"),
-                          reply="Here it is ![chart](https://x.example/chart.png)"))
+    media = asyncio.run(full_turn(adapter, media_stub, task_cls("doc.turn2", "doc", "t", "chart please"),
+                                  reply="Here it is ![chart](https://x.example/chart.png)"))
     results["attachment after the reply never replaces it"] = [
         media_stub.answers == [("doc.turn2", "Here it is")], repr(media_stub.answers)]
+    results["two tasks in a row, two sessions"] = [
+        seen.get("session") == "agent:main:gemini_voice:dm:owner:doc.turn1"
+        and media.get("session") == "agent:main:gemini_voice:dm:owner:doc.turn2", f"{seen.get('session')} {media.get('session')}"]
     results.update(stateful_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
     results.update(ledger_checks(entry.adapter_factory, type(adapter).__module__.rsplit(".", 1)[0],
                                  Path(os.environ["HERMES_HOME"])))

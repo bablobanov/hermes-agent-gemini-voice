@@ -39,8 +39,9 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
   `[Hermes] reply:` and the answer
 - **Digests out.** Any Hermes cron job can deliver into a new document (`gemini_voice:doc`) or into an event
   at a given time (`gemini_voice:event-0800`), so a morning briefing becomes *"What's on my calendar at 8?"*
-- **One conversation.** All voice tasks go to one chat, like a private messenger chat. When Hermes needs a
-  decision it asks in its reply, and you answer by dictating a new task
+- **One object, one session.** Every task (an event, a document or a sheet) is a Hermes session of its own,
+  with no history shared between tasks: your current rules, skills and memory apply to each one, and context
+  never piles up. When Hermes needs a decision it asks in its reply; you answer with a new complete task
 - **Only your own objects.** Invitations, documents shared with you and events other people put on your
   calendar are ignored, even with the label in the title (see [Safety](#safety-and-disclosure))
 
@@ -60,8 +61,8 @@ Gemini app ──creates──► event / doc / sheet with "Hermes" in the title
     the rows milk, bread, cheese"*. Hermes answers in the rows below
 - Pick a label that speech recognition writes reliably. A short nickname can come out as other words (a Russian
   "Афоня" became "о фоне", "about the background"), and then the object is not a task; a full name worked
-- Gemini cannot edit an existing document or add a row to an existing sheet, so the conversation continues
-  with new objects
+- Gemini cannot edit an existing document or add a row to an existing sheet, so every follow-up is a new
+  object
 - Gemini does not announce that the reply is ready; you ask for it when you want it. For events the natural
   question works: *"What's on my calendar tomorrow at 10?"*. Asking by time is safer than by title: speech
   recognition may write the label in another alphabet (a Russian "Гермес" came out as "Hermes") and the title
@@ -172,7 +173,7 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
 | "Create an event in Google Calendar tomorrow at 9 titled Hermes documents for the passport office" | the answer lands in the event description |
 | "Create a spreadsheet in Google Sheets titled Hermes expenses with the rows fuel 3000, parking 400" | Hermes handles it and answers in the next rows |
 | "Read the document Hermes landlord" / "What's on my calendar tomorrow at 9?" | Gemini reads the reply |
-| "Create a document Hermes landlord reply and put the text in it: yes, send it" | answers a question Hermes asked in its previous reply |
+| "Create a document Hermes landlord and put the text in it: the heating is off since Monday, write to the landlord and send it" | answers a question Hermes asked: a new task does not see the earlier one, so say it in full |
 
 Deliver a cron job's output by voice-friendly target:
 
@@ -229,8 +230,9 @@ voice chat itself is not a delivery target. When you ask by voice for something 
 - **Engine internals:** besides the documented plugin API, the plugin imports
   `gateway.session_context.get_session_env` (the `pre_tool_call` hook does not say which platform a tool call
   runs on, and `clarify` is blocked only here) and reads a few underscore attributes of its adapter base class,
-  the gateway runner and gateway events: whether the voice chat's turn is still running, whether the gateway
-  is resuming turns after a restart, the streamed final text, the status writer. `hermes plugins validate` on
+  the gateway runner and gateway events: whether a voice task's turn is still running, whether the gateway
+  is resuming turns after a restart, the streamed final text, the status writer; a dead turn's session lock
+  is cleared with the base class's own healing. `hermes plugins validate` on
   0.22.0 lists the import as a catalog rule 9 warning. The engine contract test covers each of them: run it
   against a new Hermes release before upgrading (see [Tests](#tests))
 - **Background work:** a polling task inside the gateway process while the platform is connected
@@ -241,7 +243,7 @@ voice chat itself is not a delivery target. When you ask by voice for something 
 - **At most once:** every object is recorded before it is handed over and is never handed over again. Tasks
   run one at a time: the next starts only when the gateway has finished the previous turn. After a restart
   new tasks wait until the gateway has resumed the interrupted turn; Hermes reports that task in its object
-  and asks whether to continue (answer with a new task). A reply without its anchor goes only to that
+  and asks whether to continue (answer with a new complete task). A reply without its anchor goes only to that
   interrupted task, never into another object. A final reply is saved in the plugin's journal the moment it
   arrives, so a restart before it reaches Google does not lose it; replies the gateway re-sends after a crash
   never choose an object (one the plugin already holds is acknowledged, any other is refused). If no reply

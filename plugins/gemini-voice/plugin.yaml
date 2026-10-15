@@ -1,7 +1,7 @@
 name: gemini-voice
 label: Gemini Voice
 kind: platform
-version: 0.1.2
+version: 0.1.3
 description: >
   Give Hermes a task on Android without opening a messenger: call Gemini with its button, even from the lock
   screen, and say it in one sentence, e.g. "create a document Hermes ... and put the text in it: ..." (or an

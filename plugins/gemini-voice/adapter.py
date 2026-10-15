@@ -61,7 +61,7 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
     splits_long_messages = True  # one final reply per turn; length is handled per Google object
     supports_async_delivery = False  # a late detached message could land in the wrong task object
     # After a restart the gateway resumes an interrupted turn by reporting it and asking what next
-    # (the owner answers with a new voice task), instead of silently redoing steps already done.
+    # (the owner answers with a new complete voice task), instead of silently redoing steps already done.
     interactive_resume = True
 
     def __init__(self, config: PlatformConfig, *, settings: Settings, store: Any,
@@ -70,7 +70,6 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
         self._settings, self._store, self._read_secret = settings, store, read_secret
         self._bridge: Optional[VoiceBridge] = None
         self._poller: Optional["asyncio.Task[Any]"] = None
-        self._owner_key: Optional[str] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._poller is not None and not self._poller.done():
@@ -189,23 +188,30 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
         await bridge.on_turn_complete(getattr(event, "message_id", None), str(outcome.value),
                                       streamed if isinstance(streamed, str) else "")
 
-    def _owner_source(self, message_id: Optional[str] = None) -> Any:
+    def _owner_source(self, key: str) -> Any:
+        """One task object, one Hermes session: the object's key is the thread of the owner's chat, so the
+        session key is ``...:dm:owner:<key>`` and no task sees another one's history (the engine's own
+        pattern of a synthetic per-message thread). Replies still go to the chat ``owner``, anchored on
+        the object."""
         return self.build_source(chat_id=OWNER_CHAT, chat_name="Gemini voice", chat_type="dm",
-                                 user_id=OWNER_CHAT, user_name=OWNER_NAME, message_id=message_id)
+                                 user_id=OWNER_CHAT, user_name=OWNER_NAME, thread_id=key, message_id=key)
 
     def _owner_session_busy(self) -> bool:
         """Whether a new task must wait: the gateway is still resuming turns cut off by a restart (a task
-        handed over now would only be parked and its turn reported empty), or a turn in the voice chat is
-        running. A guard whose turn has already ended is not busy: handing the next task over through
-        ``handle_message`` is what makes the gateway heal such a guard."""
+        handed over now would only be parked and its turn reported empty), or a voice task's turn is
+        running (tasks run one at a time, each in its own session). A guard whose turn has already ended
+        is not busy, and the base class's own healing clears it here: the next task has a session key of
+        its own, so ``handle_message`` would never meet that guard again."""
         if getattr(getattr(self, "gateway_runner", None), "_startup_restore_in_progress", False) is True:
             return True
-        if self._owner_key is None:
-            self._owner_key = self._source_session_key(self._owner_source())
-        if self._owner_key not in getattr(self, "_active_sessions", {}):
-            return False
+        heal = getattr(self, "_heal_stale_session_lock", None)
         stale = getattr(self, "_session_task_is_stale", None)
-        return not (callable(stale) and stale(self._owner_key))
+        for key in list(getattr(self, "_active_sessions", {})):
+            if callable(heal) and heal(key):
+                continue
+            if not (callable(stale) and stale(key)):
+                return True
+        return False
 
     async def _dispatch(self, task: Task) -> None:
         source = self._owner_source(task.key)

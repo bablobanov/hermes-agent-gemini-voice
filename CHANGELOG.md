@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+- One object, one session: every voice task (an event, a document or a sheet) is a Hermes session of its own,
+  with no history shared between tasks. Current rules, skills and memory apply to each task and context never
+  piles up; before, all tasks shared one conversation that never ended, because Hermes no longer resets gateway
+  conversations on a timer. The object's key is the thread of the owner's chat, so replies, their routing by
+  object and cron delivery work as before. When Hermes asks a question, answer with a new complete task
+
 ## 0.1.2
 
 - The descriptions lead with what the plugin is for: on Android you give Hermes a task without opening a

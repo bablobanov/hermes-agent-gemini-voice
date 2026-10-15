@@ -17,14 +17,16 @@ logger = logging.getLogger("gemini_voice")
 HOME_CHANNEL_ENV = "GEMINI_VOICE_HOME_CHANNEL"
 
 PLATFORM_HINT = (
-    "This chat is the owner's voice channel. Each message is a task the owner dictated to the Gemini app "
+    "This conversation is one task from the owner's voice channel: the owner dictated it to the Gemini app "
     "on their phone, which saved it as a Google Calendar event, Doc or Sheet in the owner's own account. "
+    "Every voice task is a conversation of its own, without the history of earlier ones. "
     "Your final reply is written into that same Google object and read aloud by Gemini when the owner "
     "asks, so reply in plain text without Markdown, briefly enough to listen to (about 150 words unless "
     "the task asks for more), in the language of the task. You cannot ask a clarifying question in the "
     "middle of a turn: make a reasonable assumption, or put the question in your final reply. Whenever "
-    "your rules require the owner's confirmation, ask for it in the final reply; the owner answers by "
-    "dictating a new task, which arrives in this same chat. Files, images and audio are not delivered "
+    "your rules require the owner's confirmation, ask for it in the final reply; the owner answers with a "
+    "new complete task, which starts a new conversation that does not see this one, so say briefly what "
+    "the new task must contain besides the answer. Files, images and audio are not delivered "
     "here: put everything into the text. This chat receives nothing later on its own, neither scheduled "
     "jobs nor background-process notices: when the owner asks for something at a later time or on a "
     "schedule (a reminder, a daily digest), create the cron job with deliver set to gemini_voice:doc (a new "
@@ -35,7 +37,7 @@ PLATFORM_HINT = (
 CLARIFY_BLOCK = (
     "clarify is not available on the Gemini voice channel: the owner cannot answer in the middle of a "
     "turn. Make a reasonable assumption, or ask your question in the final reply; the owner will answer "
-    "with a new voice task in this chat."
+    "with a new complete voice task, which starts a conversation of its own."
 )
 
 

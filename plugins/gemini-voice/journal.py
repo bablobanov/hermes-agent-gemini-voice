@@ -13,7 +13,7 @@ A closing note Google cannot take at once is kept (``note_pending``) and written
 
 ``dispatched`` is written to disk *before* the task is handed to the gateway, and a dispatched task is
 never handed over again. A restart therefore cannot start a task twice: the gateway resumes the
-interrupted turn in the same chat, or the task is closed as ``abandoned`` with a note in the object.
+interrupted turn in the task's own session, or the task is closed as ``abandoned`` with a note in the object.
 
 One process owns the journal: the gateway's poller. Out-of-process cron delivery uses ``NullStore``.
 """
