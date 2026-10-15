@@ -125,18 +125,22 @@ CRON_FOOTER = '\n\nTo stop or manage this job, send me a new message (e.g. "stop
 def strip_cron_wrapper(content: str) -> str:
     """The job output inside the scheduler's wrapper, exactly; ``content`` unchanged unless it is precisely
     ``Cronjob Response: <name>\\n(job_id: <id>)\\n-------------\\n\\n<output>\\n\\nTo stop … "stop reminder <name>").``
-    with the same name in the header and the footer and a one-line id. An empty output stays empty."""
+    with the same name in the header and the footer and a one-line id. Every id line is tried as the end of the
+    name; only a single fitting reading is used, two or more leave the text as it is. An empty output stays
+    empty. A text imitating the whole shape is read the same way: the format carries no key."""
     if not content.startswith(CRON_HEADER):
         return content
-    id_at = content.find(CRON_JOB_ID)  # the name is everything before the first id line
-    id_end = content.find(")" + CRON_DIVIDER, id_at + 1)
-    if id_at < 0 or id_end < 0 or "\n" in content[id_at + len(CRON_JOB_ID):id_end]:
-        return content
-    name = content[len(CRON_HEADER):id_at]
-    start, footer = id_end + 1 + len(CRON_DIVIDER), CRON_FOOTER + name + '").'
-    if not content.endswith(footer) or len(content) - len(footer) < start:
-        return content
-    return content[start:len(content) - len(footer)]
+    readings = []
+    id_at = content.find(CRON_JOB_ID)
+    while id_at >= 0:
+        id_end = content.find(")" + CRON_DIVIDER, id_at + 1)
+        name = content[len(CRON_HEADER):id_at]
+        start, footer = id_end + 1 + len(CRON_DIVIDER), CRON_FOOTER + name + '").'
+        if (id_end >= 0 and "\n" not in content[id_at + len(CRON_JOB_ID):id_end] and content.endswith(footer)
+                and len(content) - len(footer) >= start):
+            readings.append(content[start:len(content) - len(footer)])
+        id_at = content.find(CRON_JOB_ID, id_at + 1)
+    return readings[0] if len(readings) == 1 else content
 
 
 def plain_text(content: Optional[str]) -> str:

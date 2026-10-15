@@ -66,6 +66,7 @@ class CronWrapperTests(unittest.TestCase):
         'with "quotes" and\na newline',
         "with a divider\n-------------\n\ninside",
         'with the footer\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder x").',
+        "with an id line\n(job_id: 1)\n-------------\n\ninside",  # only the real id line fits
     )
 
     def test_exact_output_comes_back_for_any_name(self):
@@ -88,7 +89,9 @@ class CronWrapperTests(unittest.TestCase):
                      wrapped.replace('stop reminder Брифинг голосом"', 'stop reminder Другое"'),  # names differ
                      wrapped.replace("(job_id: 3e948ff561a2)", "(job_id: 3e94\n8ff561a2)"),  # id over two lines
                      wrapped.replace("\n", "\r\n"),  # the whole wrapper converted to CRLF
-                     cron_wrapped("body", name="fake\n(job_id: 1)\n-------------\n\nname")):  # an id line in the name
+                     # a name that reads both ways (a fake id line, then the footer with its own head): ambiguous
+                     cron_wrapped("body", name='A\n(job_id: fake)\n-------------\n\nTAIL\n\nTo stop or manage this job, '
+                                              'send me a new message (e.g. "stop reminder A')):
             with self.subTest(text=text):
                 self.assertEqual(textutil.strip_cron_wrapper(text), text)
 

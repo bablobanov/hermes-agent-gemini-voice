@@ -351,20 +351,24 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
     """The real scheduler end to end (``_deliver_result``: the wrapper of ``cron.wrap_response``, on by default,
     media cleanup, secret redaction, target resolution and both send lanes); nothing in the engine is patched.
     Standalone: the plugin's own sender writes to Google faked in memory. Live: the gateway's adapter on a
-    running loop hands the text to the bridge. The object must hold the job's output, not the wrapper."""
+    running loop hands the text to a stand-in bridge, and the plugin's strip is applied to exactly that text.
+    The object must hold the job's output as redacted by the engine, never the wrapper."""
     import threading
     from contextlib import ExitStack
     from importlib import import_module
     from unittest import mock
     import cron.scheduler_delivery as delivery
+    from agent.redact import redact_sensitive_text
     from gateway.config import Platform
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from fake_google import FakeGoogle
-    api, textutil, fake = import_module(package + ".google_api"), import_module(package + ".textutil"), FakeGoogle()
+    api, textutil = import_module(package + ".google_api"), import_module(package + ".textutil")
+    split_title = import_module(package + ".bridge").split_title
     real_client, real_tokens = api.GoogleClient, api.TokenSource
     secret = "ghp_" + "Ab3" * 12
     output = ("Briefing\n\nmail: 3 letters, token " + secret + "\n"
               'To stop or manage this job, send me a new message (e.g. "x"). Quoted by the job itself')
+    expected = redact_sensitive_text(output, force=True)  # what the engine lets out of a cron job
+    title, body = split_title(textutil.plain_text(expected), "default")
+    config_wrap = (delivery._sched.load_config() or {}).get("cron", {}).get("wrap_response", True)
 
     def job(target: str) -> dict:
         return {"id": "job1", "name": "Briefing job", "deliver": f"gemini_voice:{target}"}
@@ -372,9 +376,10 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
     names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
              "GEMINI_VOICE_REFRESH_TOKEN": "token"}
     stub, previous = StubBridge(), adapter._bridge
-    loop = asyncio.new_event_loop()
-    runner = threading.Thread(target=loop.run_forever, daemon=True)
     with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(sys, "path", [str(Path(__file__).resolve().parent)] + sys.path))
+        from fake_google import FakeGoogle
+        fake = FakeGoogle()
         stack.enter_context(mock.patch.dict(os.environ, names))
         os.environ.pop("GEMINI_VOICE_HOME_CHANNEL", None)  # restored with the rest when the stack closes
         stack.enter_context(mock.patch.object(api, "GoogleClient",
@@ -382,37 +387,40 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
         stack.enter_context(mock.patch.object(api, "TokenSource", lambda *a, **_: real_tokens(*a, transport=fake)))
         standalone_event = delivery._deliver_result(job("event-0800"), output)
         standalone_doc = delivery._deliver_result(job("doc"), output)
+        loop = asyncio.new_event_loop()
+        runner = threading.Thread(target=loop.run_forever, daemon=True)
+
+        def stop_loop() -> None:
+            if runner.is_alive():
+                loop.call_soon_threadsafe(loop.stop)
+                runner.join(5)
+            if not runner.is_alive():
+                loop.close()
+
+        stack.callback(stop_loop)
         runner.start()
-        stack.callback(loop.close)
-        stack.callback(runner.join, 5)
-        stack.callback(loop.call_soon_threadsafe, loop.stop)
         stack.callback(setattr, adapter, "_bridge", previous)
         adapter._bridge = stub
         live = delivery._deliver_result(job("event-0800"), output,
                                         adapters={Platform("gemini_voice"): adapter}, loop=loop)
     events = list(fake.events.values())
     docs = [doc_id for doc_id, doc in fake.docs.items() if doc.get("title")]
-    description = events[0].get("description", "") if len(events) == 1 else ""
-    doc_text = fake.doc_text(docs[0]) if len(docs) == 1 else ""
     sent = stub.outputs[0][1] if len(stub.outputs) == 1 else ""
-    wrapper = ("Cronjob", "job_id", 'stop reminder Briefing job')
     return {
-        "real cron run, standalone lane: event titled by the output": [
-            standalone_event is None and len(events) == 1 and events[0].get("summary") == "Briefing",
-            f"{standalone_event!r} {events!r}"],
-        "real cron run, standalone lane: event text without the wrapper": [
-            description.startswith("mail: 3 letters") and description.endswith("Quoted by the job itself")
-            and not any(w in description for w in wrapper) and secret not in description, repr(description)],
-        "real cron run, standalone lane: document without the wrapper": [
-            standalone_doc is None and doc_text.startswith("[Hermes digest] Briefing\nmail: 3 letters")
-            and not any(w in doc_text for w in wrapper) and secret not in doc_text, f"{standalone_doc!r} {doc_text!r}"],
-        "real cron run, live lane: the adapter gets the wrapped output": [
-            live is None and sent.startswith(textutil.CRON_HEADER) and stub.outputs[0][0] == "event-0800",
-            f"{live!r} {stub.outputs!r}"],
-        "real cron run, live lane: the wrapper comes off exactly": [
-            textutil.strip_cron_wrapper(sent).startswith("Briefing\n\nmail: 3 letters")
-            and textutil.strip_cron_wrapper(sent).endswith("Quoted by the job itself")
-            and not any(w in textutil.strip_cron_wrapper(sent) for w in wrapper), repr(sent)],
+        "probe config leaves cron.wrap_response on": [config_wrap is True, repr(config_wrap)],
+        "engine redaction changes the probe output": [secret not in expected and expected != output, repr(expected)],
+        "real cron run, standalone lane: the event is the redacted output": [
+            standalone_event is None and len(events) == 1 and events[0].get("summary") == title
+            and events[0].get("description") == body, f"{standalone_event!r} {title!r} {body!r} {events!r}"],
+        "real cron run, standalone lane: the document is the redacted output": [
+            standalone_doc is None and len(docs) == 1
+            and fake.doc_text(docs[0]) == f"{textutil.OUTPUT_MARKER} {title}\n{body}\n",
+            f"{standalone_doc!r} {[fake.doc_text(d) for d in docs]!r}"],
+        "real cron run, live lane: the adapter gets the wrapped redacted output": [
+            live is None and len(stub.outputs) == 1 and stub.outputs[0][0] == "event-0800"
+            and sent.startswith(textutil.CRON_HEADER) and secret not in sent, f"{live!r} {stub.outputs!r}"],
+        "real cron run, live lane: strip gives the redacted output back exactly": [
+            textutil.strip_cron_wrapper(sent) == expected, repr(sent)],
     }
 
 
