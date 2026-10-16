@@ -102,8 +102,8 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
 ## Requirements
 
 - Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
-  Tested live on 0.21.6; the engine contract test (61 checks) passes on 0.21.6 and 0.22.0. Hermes does not load
-  platform plugins under `plugins.isolation: host`, so this plugin does not work in that mode
+  Tested live on 0.21.6; the engine contract test (64 checks) passes on 0.21.6, 0.22.0 and 0.22.2. Hermes does
+  not load platform plugins under `plugins.isolation: host`, so this plugin does not work in that mode
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
   and Google Sheets APIs** enabled and an **OAuth client of type "Desktop app"**
@@ -113,13 +113,17 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
 
 ## Install
 
-1. Install and enable the plugin (from the catalog, or clone this repository and copy
-   `plugins/gemini-voice` into your Hermes plugins directory):
+1. Install the plugin from this repository and enable it:
 
    ```sh
-   hermes plugins install gemini-voice
+   hermes plugins install bablobanov/hermes-agent-gemini-voice/plugins/gemini-voice
    hermes plugins enable gemini-voice
    ```
+
+   Hermes warns that the source is custom, not from its catalog, and asks for the `GEMINI_VOICE_*` values:
+   press Enter, step 2 stores them. The catalog entry is submitted
+   ([NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)) and waits for
+   an OAuth route for plugins ([#139077](https://github.com/NousResearch/hermes-agent/issues/139077)).
 
 2. Authorize the plugin's own Google access, once, in a terminal on the Hermes host. Have the OAuth
    client JSON at hand, or paste the client ID and secret when asked:

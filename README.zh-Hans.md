@@ -87,7 +87,7 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
 ## 前提条件
 
 - Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
-  引擎契约测试（61 项检查）在 0.21.6 和 0.22.0 上均通过。`plugins.isolation: host` 模式下 Hermes 不加载平台插件，
+  引擎契约测试（64 项检查）在 0.21.6、0.22.0 和 0.22.2 上均通过。`plugins.isolation: host` 模式下 Hermes 不加载平台插件，
   因此本插件在该模式下不可用
 - 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
@@ -99,12 +99,16 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
 
 ## 安装
 
-1. 安装并启用插件（从插件目录安装，或克隆本仓库并把 `plugins/gemini-voice` 复制到 Hermes 插件目录）：
+1. 从本仓库安装插件并启用：
 
    ```sh
-   hermes plugins install gemini-voice
+   hermes plugins install bablobanov/hermes-agent-gemini-voice/plugins/gemini-voice
    hermes plugins enable gemini-voice
    ```
+
+   Hermes 会提示这是自定义来源、不在其插件目录中，并询问 `GEMINI_VOICE_*` 的值：直接按回车，第 2 步会保存它们。
+   插件目录的收录申请已提交（[NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)），
+   正在等待面向插件的 OAuth 途径（[#139077](https://github.com/NousResearch/hermes-agent/issues/139077)）。
 
 2. 在 Hermes 主机的终端里为插件授权一次 Google 访问。准备好 OAuth 客户端 JSON 文件，或在提示时粘贴客户端 ID 和密钥：
 

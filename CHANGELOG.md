@@ -7,6 +7,10 @@
   piles up; before, all tasks shared one conversation that never ended, because Hermes no longer resets gateway
   conversations on a timer. The object's key is the thread of the owner's chat, so replies, their routing by
   object and cron delivery work as before. When Hermes asks a question, answer with a new complete task
+- README, updated after the tag (plugin code unchanged): install from this repository,
+  `hermes plugins install bablobanov/hermes-agent-gemini-voice/plugins/gemini-voice`; the catalog entry is
+  submitted and waits for an OAuth route for plugins. The engine contract test counts 64 checks and passes on
+  0.21.6, 0.22.0 and 0.22.2
 
 ## 0.1.2
 
