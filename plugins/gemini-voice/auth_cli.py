@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, TextIO
 
-from .google_api import (SIGN_IN, ApiError, AuthError, GoogleClient, SignInError, TransientError, Transport,
+from .google_api import (SIGN_IN, ApiError, AuthError, GoogleClient, SignInError, TransientError, Transport, auth_fix,
                          hermes_transport)
 
 ENV_CLIENT_ID = "GEMINI_VOICE_CLIENT_ID"
@@ -44,14 +44,14 @@ def run_auth(out: TextIO) -> int:
 def run_check(io: CliIO) -> int:
     """One request to each API through Hermes's route; prints per-API results, never secrets."""
     out = io.stdout
-    absent = [name for name in ENV_NAMES if not io.read_secret(name)]
-    if absent:
-        print(f"NOT_CONFIGURED: missing {', '.join(absent)} in the Hermes .env", file=out)
+    if not io.read_secret(ENV_CLIENT_ID):  # the secret stays Hermes's: a missing one comes back from the route
+        print(f"NOT_CONFIGURED: missing {ENV_CLIENT_ID} in the Hermes .env", file=out)
         return 1
     try:
         failures = _probe_apis(GoogleClient(transport=io.transport), out)
     except SignInError as exc:
-        print(f"SIGN_IN_NEEDED: {exc}", file=out)
+        print(f"AUTH_FAILED: {exc}", file=out)
+        print(f"To fix it: {auth_fix(exc.code)}", file=out)
         return 1
     return 0 if not failures else 1
 

@@ -150,7 +150,8 @@ approvals, exactly once across a restart, a revoked sign-in, a schedule set by v
    hermes gemini-voice check
    ```
 
-   Expected: `OK` for the Calendar, Drive, Docs and Sheets APIs. `SIGN_IN_NEEDED` says what to run.
+   Expected: `OK` for the Calendar, Drive, Docs and Sheets APIs. Otherwise `AUTH_FAILED` gives the reason and
+   the fix.
 
 4. Optional settings in `config.yaml` (defaults shown):
 

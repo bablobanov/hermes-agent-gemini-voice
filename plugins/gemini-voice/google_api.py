@@ -106,6 +106,22 @@ def _route_error(exc: Exception, not_signed_in: type, hermes_auth_error: type, n
     return SignInError("route_failed", type(exc).__name__)
 
 
+def auth_fix(code: str) -> str:
+    """What the operator does about an authorization failure with this code; never a secret or a token."""
+    if code in CLIENT_CODES:
+        return ("check GEMINI_VOICE_CLIENT_ID and GEMINI_VOICE_CLIENT_SECRET in the Hermes .env, then restart the "
+                "gateway")
+    if code in ("not_signed_in", "insufficient_scope"):
+        return f"run `{SIGN_IN}` on the Hermes host and allow all four permissions; polling resumes by itself"
+    if code == "unauthorized":
+        return ("nothing at first: Hermes refreshes the token when it expires and polling retries every 15 minutes; "
+                f"if it keeps failing, run `{SIGN_IN}`")
+    if code == "hermes_too_old":
+        return "update Hermes to a release with the plugin OAuth route"
+    # route_refused, route_failed, invalid_scope and anything new: a new sign-in would not help
+    return "check that this Hermes release supports this version of the plugin (the reason is above)"
+
+
 def hermes_transport(
     method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float,
 ) -> Tuple[int, Dict[str, str], bytes]:

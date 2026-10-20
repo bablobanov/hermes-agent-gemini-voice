@@ -145,7 +145,7 @@ NousResearch/hermes-agent#139985 до слияния, ранняя сборка 
    hermes gemini-voice check
    ```
 
-   Ожидается `OK` для Calendar, Drive, Docs и Sheets API. `SIGN_IN_NEEDED` подскажет, что запустить.
+   Ожидается `OK` для Calendar, Drive, Docs и Sheets API. Иначе `AUTH_FAILED` назовёт причину и что сделать.
 
 4. Необязательные настройки в `config.yaml` (значения по умолчанию):
 

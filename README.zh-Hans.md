@@ -131,7 +131,7 @@ Hermes 的插件 OAuth 途径（2026 年 10 月 16 日，真实 Google 账号，
    hermes gemini-voice check
    ```
 
-   预期 Calendar、Drive、Docs、Sheets 四个 API 都显示 `OK`。`SIGN_IN_NEEDED` 会说明需要运行什么命令。
+   预期 Calendar、Drive、Docs、Sheets 四个 API 都显示 `OK`。否则 `AUTH_FAILED` 会给出原因和处理方法。
 
 4. `config.yaml` 中的可选设置（以下为默认值）：
 

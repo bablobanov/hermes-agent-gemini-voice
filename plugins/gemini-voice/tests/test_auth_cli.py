@@ -45,9 +45,25 @@ class CheckAndStatusTests(unittest.TestCase):
         cli_io, out = self.make_io(fake, CONFIGURED)
         self.assertEqual(cli.run_check(cli_io), 1)
         text = out.getvalue()
-        self.assertIn("SIGN_IN_NEEDED: not_signed_in", text)
-        self.assertIn("hermes auth add gemini-voice:google", text)
+        self.assertIn("AUTH_FAILED: not_signed_in", text)
+        self.assertIn("To fix it: run `hermes auth add gemini-voice:google`", text)
         self.assertNotIn(" API: ", text)
+
+    def test_check_never_reads_the_client_secret(self):
+        asked = []
+
+        def read_secret(name):
+            asked.append(name)
+            if name == "GEMINI_VOICE_CLIENT_SECRET":
+                raise AssertionError("the plugin read the client secret; it is Hermes's to read")
+            return "id"
+        fake = FakeGoogle()
+        fake.refusal = api.SignInError("oauth_client_secret_missing", "GEMINI_VOICE_CLIENT_SECRET is not set.")
+        out = io.StringIO()
+        self.assertEqual(cli.run_check(cli.CliIO(stdout=out, read_secret=read_secret, transport=fake)), 1)
+        self.assertEqual(asked, ["GEMINI_VOICE_CLIENT_ID"])
+        self.assertIn("To fix it: check GEMINI_VOICE_CLIENT_ID and GEMINI_VOICE_CLIENT_SECRET in the Hermes .env",
+                      out.getvalue())
 
     def test_check_names_the_api_google_refuses(self):
         fake = FakeGoogle()
@@ -61,7 +77,7 @@ class CheckAndStatusTests(unittest.TestCase):
         fake = FakeGoogle()
         cli_io, out = self.make_io(fake, {})
         self.assertEqual(cli.run_check(cli_io), 1)
-        self.assertIn("NOT_CONFIGURED: missing GEMINI_VOICE_CLIENT_ID, GEMINI_VOICE_CLIENT_SECRET", out.getvalue())
+        self.assertIn("NOT_CONFIGURED: missing GEMINI_VOICE_CLIENT_ID in the Hermes .env", out.getvalue())
         self.assertEqual(fake.calls, [])
 
     def test_status_prints_counts_without_titles(self):

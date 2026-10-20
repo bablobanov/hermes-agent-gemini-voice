@@ -562,8 +562,15 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         linked = importlib.util.module_from_spec(spec_link)
         stack.enter_context(mock.patch.dict(sys.modules, {spec_link.name: linked}))  # dataclasses look it up
         spec_link.loader.exec_module(linked)
+        link_key = f"{plugin_oauth.plugin_key(link)}:{client.id}"
+        link_unsigned = call(module=linked)  # the link's own key: no grant yet, whatever the other copy holds
+        plugin_oauth._write_grant(link_key, {"access_token": "probe-access-link", "refresh_token": "probe-refresh",
+                                             "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+                                             "fingerprint": client.fingerprint})
         through_link = call(module=linked)
-    texts = " ".join(str(x) for x in (unsigned, off_list, rejected, flaky, revoked, no_client, through_link))
+        link_auth = sent[-1].headers.get("authorization") if sent else ""
+    texts = " ".join(str(x) for x in (unsigned, off_list, rejected, flaky, revoked, no_client, link_unsigned))
+    floor = re.search(r">=\s*([0-9][0-9.]*)", spec)
 
     def code(result):
         return getattr(result, "code", repr(result))
@@ -571,9 +578,11 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
     return {
         "route: Hermes admits the oauth: entry": [
             len(clients) == 1 and clients[0].id == api.OAUTH_ID and not problems, repr(problems)],
-        "route: no reviewer warning, tests included": [warnings == [], repr(warnings)],
-        "route: requires_hermes excludes every release without the route": [
-            bool(spec) and not any(version_satisfies(spec, v) for v in ("0.21.6", "0.22.0", "0.22.1", "0.22.2")), spec],
+        "route: no reviewer warning, tests included": [bool(clients) and not problems and warnings == [],
+                                                       repr(warnings or problems)],
+        "route: requires_hermes admits its floor and no release without the route": [
+            floor is not None and version_satisfies(spec, floor.group(1))
+            and not any(version_satisfies(spec, v) for v in ("0.21.6", "0.22.0", "0.22.1", "0.22.2")), spec],
         "route: no sign-in, nothing sent, the command named": [
             isinstance(unsigned, api.SignInError) and unsigned.code == "not_signed_in" and unsigned_sent == 0
             and api.SIGN_IN in str(unsigned), str(unsigned)],
@@ -583,7 +592,8 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
             and json.loads(first.content) == {"requests": [{"insertText": {"text": "Привет"}}]},
             repr(first.headers if first is not None else ok)],
         "route: a host outside oauth: hosts is refused before sending": [
-            code(off_list) == "route_refused" and "PermissionError" in str(off_list) and after_off == after_ok,
+            code(off_list) == "route_refused" and "PermissionError" in str(off_list) and "example.com" in str(off_list)
+            and after_off == after_ok,
             f"{after_ok}->{after_off} {off_list}"],
         "route: a 401 is one request and an auth error": [
             code(rejected) == "unauthorized" and after_401 == after_off + 1, f"{after_off}->{after_401} {rejected}"],
@@ -593,15 +603,19 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         "route: Hermes refreshes with the client from .env and keeps the refresh token": [
             getattr(refreshed, "status", 0) == 200 and refreshed_auth == "Bearer probe-access-2"
             and kept_refresh == "probe-refresh" and refresh_form.get("grant_type") == "refresh_token"
-            and refresh_form.get("client_secret") == canary, f"{refreshed_auth} {sorted(refresh_form)}"],
+            and refresh_form.get("refresh_token") == "probe-refresh"
+            and refresh_form.get("client_id") == env["GEMINI_VOICE_CLIENT_ID"] and refresh_form.get("client_secret") == canary,
+            f"{refreshed_auth} {sorted(refresh_form)}"],
         "route: a refused refresh is a revoked sign-in": [
             code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant", str(revoked)],
         "route: a missing client ID needs the operator": [
             isinstance(no_client, api.SignInError) and code(no_client) == "oauth_client_id_missing", str(no_client)],
         "route: no secret or token in the plugin's errors": [
             all(s not in texts for s in (canary, "probe-access", "probe-refresh")), texts[:300]],
-        "route: a plugin installed through a link is still the caller": [
-            code(through_link) == "not_signed_in", f"{link_kind}: {through_link}"],
+        "route: a plugin installed through a link is the caller, under its own key": [
+            code(link_unsigned) == "not_signed_in" and "'gemini-voice-link'" in str(link_unsigned)
+            and getattr(through_link, "status", 0) == 200 and link_auth == "Bearer probe-access-link",
+            f"{link_kind}: {link_unsigned} | {link_auth}"],
     }
 
 

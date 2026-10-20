@@ -158,6 +158,22 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+class FixHintTests(unittest.TestCase):
+    """The fix named in the status and in ``check`` matches what can actually help."""
+
+    def test_each_code_gets_its_own_fix(self):
+        sign_in = "run `hermes auth add gemini-voice:google`"
+        for code in ("not_signed_in", "insufficient_scope"):
+            self.assertIn(sign_in, api.auth_fix(code), code)
+        for code in ("oauth_client_id_missing", "oauth_client_secret_missing", "invalid_client", "unauthorized_client"):
+            self.assertIn("in the Hermes .env, then restart the gateway", api.auth_fix(code), code)
+            self.assertNotIn("hermes auth add", api.auth_fix(code), code)
+        self.assertIn("update Hermes", api.auth_fix("hermes_too_old"))
+        self.assertTrue(api.auth_fix("unauthorized").startswith("nothing at first"))
+        for code in ("route_refused", "route_failed", "invalid_scope", "something_new"):
+            self.assertNotIn("hermes auth add", api.auth_fix(code), code)  # a new sign-in would not help
+
+
 class ErrorMappingTests(unittest.TestCase):
     def check(self, status, reason, expected, code):
         def transport(method, url, headers, body, timeout):
