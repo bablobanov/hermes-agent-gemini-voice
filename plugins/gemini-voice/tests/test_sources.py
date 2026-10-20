@@ -17,7 +17,7 @@ BOUNDS = "[read: the first sheet, rows 1-500, columns A-Z]"
 
 
 def make_client(fake):
-    return api.GoogleClient(api.TokenSource("a", "b", "c", transport=fake), transport=fake)
+    return api.GoogleClient(transport=fake)
 
 
 def event(**overrides):

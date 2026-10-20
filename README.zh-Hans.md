@@ -15,8 +15,8 @@
 *“新建文档 Hermes 航班，并在里面写入文字：比较一下周五飞柏林最便宜的三个航班”*。Hermes 会发现这个文档，用它平常的工具和技能完成任务，
 并把答案写回同一个文档。之后你对 Gemini 说 *“读一下文档 Hermes 航班”*，就能听到结果。
 
-不需要新应用、不需要 Gemini API 密钥、不需要公网端点：通道就是你自己的 Google 日历、文档和表格。Hermes 通过插件
-自己的 Google OAuth 令牌读取它们，Gemini 应用负责朗读。
+不需要新应用、不需要 Gemini API 密钥、不需要公网端点：通道就是你自己的 Google 日历、文档和表格。Hermes 凭你的 Google
+登录读取它们，这个登录由 Hermes 自己保管和刷新（插件看不到令牌），Gemini 应用负责朗读。
 
 支持 **Gemini 4 Argon**，也适用于更早版本的 Gemini 应用。插件不绑定任何模型：它只看 Gemini 应用创建的
 Google 对象。
@@ -25,7 +25,7 @@ Google 对象。
 Gemini 应用 ──新建──► 标题含 "Hermes" 的日历事件 / 文档 / 表格（你的账号）
                               │ 插件每分钟轮询一次
                               ▼
-        gemini-voice ──任务──► Hermes 网关（同一个会话，沿用你的工具和规则）
+        gemini-voice ──任务──► Hermes 网关（一个对象一个会话，沿用你的工具和规则）
                               │ 最终回复
                               ▼
         回复写回同一个对象 ──► 在 Gemini 中说“读一下文档 …”
@@ -82,13 +82,17 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
 `...:dm:owner:doc.<第一个 id>` 和 `...:dm:owner:doc.<第二个 id>`，两者的系统提示都已包含当天修改过的 `AGENTS.md`，
 而 0.1.2 的共享对话从未看到它；两个回答都写进了各自的文档。
 
-已由单元测试和引擎契约测试覆盖、尚未实测：忽略其他账号的对象、审批、重启后恰好一次、被撤销的令牌、用语音设定的定时任务。
+Hermes 的插件 OAuth 途径（2026 年 10 月 16 日，真实 Google 账号，Hermes 取自 NousResearch/hermes-agent#139985 合并前的
+分支，配合本插件迁移到该途径的早期版本）：`hermes auth add gemini-voice:google` 完成登录，一次 Drive 请求带着 Hermes 附加的
+令牌发出，Hermes 在手动命令时和令牌即将过期时都刷新了令牌。
+
+已由单元测试和引擎契约测试覆盖、尚未实测：忽略其他账号的对象、审批、重启后恰好一次、被撤销的登录、用语音设定的定时任务。
 
 ## 前提条件
 
-- Hermes Agent **0.21.6 或更高版本**，并运行消息网关（本插件是一个网关平台）。已在 0.21.6 上实机测试；
-  引擎契约测试（64 项检查）在 0.21.6、0.22.0 和 0.22.2 上均通过。`plugins.isolation: host` 模式下 Hermes 不加载平台插件，
-  因此本插件在该模式下不可用
+- Hermes Agent **0.23.0 或更高版本**，并运行消息网关（本插件是一个网关平台）。Hermes 通过其插件 OAuth 途径为插件登录
+  Google，该途径首次随这个版本发布（NousResearch/hermes-agent#141510）。更早的 Hermes 请使用 gemini-voice 0.1.3（v0.1.3
+  版本）。`plugins.isolation: host` 模式下 Hermes 不加载平台插件，因此本插件在该模式下不可用
 - 本插件需要 Gemini 应用、Google 账号及 Google 服务，这些在中国大陆不可用
 - 手机上 Gemini 应用所使用的 Google 账号
 - 该账号自己的 Google Cloud 项目（免费），启用 **Google Calendar、Google Drive、Google Docs 和 Google Sheets API**，
@@ -106,19 +110,20 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
    hermes plugins enable gemini-voice
    ```
 
-   Hermes 会提示这是自定义来源、不在其插件目录中，并询问 `GEMINI_VOICE_*` 的值：直接按回车，第 2 步会保存它们。
-   插件目录的收录申请已提交（[NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)），
-   正在等待面向插件的 OAuth 途径（[#139077](https://github.com/NousResearch/hermes-agent/issues/139077)）。
+   Hermes 会提示这是自定义来源、不在其插件目录中，并询问 `GEMINI_VOICE_CLIENT_ID` 和 `GEMINI_VOICE_CLIENT_SECRET`：
+   粘贴你的 OAuth 客户端的 ID 和密钥，Hermes 会把它们保存在自己的 `.env` 中。插件目录的收录申请已提交
+   （[NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)），正在审核中。
 
-2. 在 Hermes 主机的终端里为插件授权一次 Google 访问。准备好 OAuth 客户端 JSON 文件，或在提示时粘贴客户端 ID 和密钥：
+2. 在 Hermes 主机的终端里登录一次 Google：
 
    ```sh
-   hermes gemini-voice auth --client-secret-file <PATH_TO_CLIENT_JSON>
+   hermes auth add gemini-voice:google
    ```
 
-   命令会输出一个 Google 授权链接。用登录了手机上那个 Google 账号的浏览器打开它，允许全部四项权限，然后复制无法打开的
-   页面地址（`http://localhost:1/…`）并粘贴回来。命令会把 `GEMINI_VOICE_CLIENT_ID`、`GEMINI_VOICE_CLIENT_SECRET` 和
-   `GEMINI_VOICE_REFRESH_TOKEN` 写入 Hermes 的 `.env`，不会打印任何密钥。
+   Hermes 会列出令牌将发送到的 Google 主机，输出 Google 授权页面的地址，并在本地端口上等待回跳；能打开浏览器时它会自动
+   打开，在远程主机上则会输出针对该端口的 SSH 隧道命令。用手机上的 Google 账号登录并允许全部四项权限：只有全部授予时，
+   Hermes 才会把登录保存到当前配置的 `auth.json` 中，之后由它自己刷新令牌。`hermes auth status gemini-voice:google`
+   可查看登录状态。
 
 3. 检查并用你平常的方式重启网关：
 
@@ -126,8 +131,7 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
    hermes gemini-voice check
    ```
 
-   预期输出：`TOKEN_OK scopes: calendar.events.owned drive.metadata.readonly documents spreadsheets`，且 Calendar、
-   Drive、Docs、Sheets 四个 API 都显示 `OK`。
+   预期 Calendar、Drive、Docs、Sheets 四个 API 都显示 `OK`。否则 `AUTH_FAILED` 会给出原因和处理方法。
 
 4. `config.yaml` 中的可选设置（以下为默认值）：
 
@@ -156,6 +160,15 @@ Gemini 4 Argon（2026 年 10 月 15 日），在“聊天”模式下用俄语�
    hermes config set display.platforms.gemini_voice.runtime_footer.enabled false
    ```
 
+### 从 0.1.x 升级
+
+0.1.x 自己登录并把刷新令牌保存在 `GEMINI_VOICE_REFRESH_TOKEN` 中；0.2.0 把这件事交给 Hermes。
+
+1. 把 Hermes 升级到 0.23.0 或更高版本，再把插件升级到 0.2.0
+2. 用 `hermes auth add gemini-voice:google` 登录一次（见上面第 2 步）：同一个 OAuth 客户端，由 Hermes 保管的新登录
+3. 从 Hermes 的 `.env` 中删除 `GEMINI_VOICE_REFRESH_TOKEN` 这一行：0.2.0 不再读取它
+4. 重启网关并运行 `hermes gemini-voice check`
+
 ## 使用
 
 | 对 Gemini 说 | 结果 |
@@ -183,10 +196,13 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
 
 ## 安全与披露
 
-- **网络：** 只访问 Google API（Calendar、Drive、Docs、Sheets）和 `oauth2.googleapis.com`，每次轮询和每个任务各一次。
-  没有遥测，不访问其他主机
-- **凭据：** 插件只使用三个 `GEMINI_VOICE_*` 变量中它自己的 OAuth 客户端和刷新令牌，从不读取其他工具的令牌文件。访问
-  令牌只保存在内存中；唯一写入凭据的地方是由你运行的 `hermes gemini-voice auth`，并通过 Hermes 自带的 `.env` 写入函数完成
+- **网络：** 插件的请求只发往 Google Calendar、Drive、Docs 和 Sheets API（`www.googleapis.com`、`docs.googleapis.com`、
+  `sheets.googleapis.com`），每次轮询和每个任务各一次，并且只经由 Hermes 发出。Hermes 自己在登录时访问
+  `accounts.google.com`，刷新令牌时访问 `oauth2.googleapis.com`。没有遥测，不访问其他主机
+- **凭据：** 插件不持有任何凭据。它在 `plugin.yaml` 的 `oauth:` 中声明自己的 Google 客户端；Hermes 负责登录
+  （`hermes auth add gemini-voice:google`），把登录保存在配置的 `auth.json` 中，用其 `.env` 里的 `GEMINI_VOICE_CLIENT_ID`
+  和 `GEMINI_VOICE_CLIENT_SECRET` 刷新令牌，并且只把令牌附加到发往上述三个主机的请求上（`credentialed_provider_request`，
+  不跟随重定向）。插件读取 `GEMINI_VOICE_CLIENT_ID` 只是为了判断自己是否已配置，从不读取 `auth.json` 或其他工具的令牌文件
 - **Google 权限范围：** `calendar.events.owned`、`drive.metadata.readonly`、`documents`、`spreadsheets`。没有 Gmail，
   没有完整的 Drive 访问权。插件读取文件元数据以发现新对象，读取带标签对象的文本，只写入任务对象以及它的定时投递所创建的对象
 - **谁能下达任务：** 能在这个 Google 账号里创建对象的人，通常就是拿着装有 Gemini 应用的你的手机的人。只有账号所有者本人
@@ -218,19 +234,20 @@ hermes cron create "30 7 * * *" "Morning briefing: mail, calendar, tasks" \
   其他的一律拒绝）。若在 `answer_timeout_minutes` 内没有回复，对象里会写明任务未完成
 - **摘要永远不是任务：** 定时投递创建的文档在标题和第一行都带有 `[Hermes digest]`，日历事件带有私有标记，因此输出永远不会被
   当作你的指令读回，即使其标题含有标签
-- **无人值守：** 令牌被撤销或过期时绝不会打开浏览器授权流程。平台会在网关状态中报告 `retrying / auth_failed`
-  （`gateway_state.json`、`hermes gateway status`），记录一行日志，每 15 分钟重新检查一次，网关照常运行
+- **无人值守：** 没有登录或登录被撤销时绝不会打开浏览器：`hermes auth add` 只在你的终端里运行，Hermes 在网关和定时任务
+  中会拒绝执行它。平台会在网关状态中报告 `retrying / auth_failed`（`gateway_state.json`、`hermes gateway status`），
+  记录一行日志，每 15 分钟重新检查一次，网关照常运行；重新登录后轮询会自动恢复
 
 ## 状态与排障
 
 ```sh
 hermes gemini-voice status   # 平台状态、上次成功轮询时间、任务计数（不含标题和正文）
-hermes gemini-voice check    # 令牌、权限范围和四个 API
+hermes gemini-voice check    # 通过 Hermes 保管的登录向四个 API 各发一次请求
 ```
 
 | 状态码 | 含义与处理 |
 |---|---|
-| `auth_failed` | 令牌被撤销、过期或缺少权限：运行 `hermes gemini-voice auth`，然后重启网关 |
+| `auth_failed` | 没有登录、登录被撤销或缺少权限：运行 `hermes auth add gemini-voice:google`，轮询会在 15 分钟内恢复。如果状态里写的是客户端问题（`oauth_client_id_missing`、`oauth_client_secret_missing`、`invalid_client`、`unauthorized_client`），请修正 Hermes `.env` 中的 `GEMINI_VOICE_CLIENT_ID` 和 `GEMINI_VOICE_CLIENT_SECRET` 并重启网关 |
 | `google_unreachable` | 网络或 Google 故障：轮询以最长 15 分钟的退避间隔重试；只有一个 API 故障时，其他照常工作。Google 不响应的任务会以逐渐加长的间隔重试约 45 分钟，然后以一条说明关闭，说明会在 Google 恢复响应后立即写入 |
 | `api_disabled` | 在 OAuth 客户端所属的 Cloud 项目中启用这四个 API |
 
@@ -244,8 +261,9 @@ hermes gemini-voice check    # 令牌、权限范围和四个 API
 python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-voice/tests -v
 ```
 
-单元测试不需要网络，也不需要 Hermes，使用内存中的 Google 模拟。可选的引擎契约测试会通过真实的 Hermes 检出加载插件，
-没有检出时跳过（跳过不等于通过）：
+单元测试不需要网络，也不需要 Hermes，使用内存中的 Google 模拟。可选的引擎契约测试（77 项检查）会通过真实的 Hermes 检出
+加载插件，没有检出时跳过（跳过不等于通过）。其中的途径检查运行 Hermes 真实的插件 OAuth 途径，只模拟网络；在没有该途径的
+Hermes 上，它们会合并为一项失败的检查：
 
 ```sh
 GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
@@ -262,7 +280,7 @@ GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> \
 
 ## 项目
 
-- `plugins/gemini-voice/`：插件本体（仅用标准库，无 Python 依赖）及其测试
+- `plugins/gemini-voice/`：插件本体（只用标准库和 Hermes 自身的模块，没有自己的 Python 依赖）及其测试
 - [更新日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全](SECURITY.md) · [MIT 许可证](LICENSE)
 
 MIT © 2026 Ilya Balobanov。独立集成，并非 Google 或 Nous Research 的官方产品。Android、Gemini 和 Google 是 Google LLC 的商标。

@@ -17,7 +17,8 @@ flights to Berlin on Friday"*. Hermes picks the document up, does the work with 
 answer into the same document. Later you ask Gemini *"Read the document Hermes flights"* and listen to it.
 
 No new app, no Gemini API key, no public endpoint: the channel is your own Google Calendar, Docs and Sheets.
-Hermes reads them through the plugin's own Google OAuth token and the Gemini app reads them aloud.
+Hermes reads them with your Google sign-in, which Hermes itself holds and refreshes (the plugin never sees the
+token), and the Gemini app reads them aloud.
 
 Supports **Gemini 4 Argon** and works with earlier Gemini app versions. The plugin is not tied to a model: it
 sees only the Google objects the app creates.
@@ -26,7 +27,7 @@ sees only the Google objects the app creates.
 Gemini app ──creates──► event / doc / sheet with "Hermes" in the title (your account)
                                   │ the plugin polls once a minute
                                   ▼
-          gemini-voice ──task──► Hermes gateway (one chat, your usual tools and rules)
+          gemini-voice ──task──► Hermes gateway (one session per object, your usual tools and rules)
                                   │ final reply
                                   ▼
           the reply is written into the same object ──► "Read the document …" in Gemini
@@ -96,13 +97,19 @@ sessions, `...:dm:owner:doc.<first id>` and `...:dm:owner:doc.<second id>`, and 
 `AGENTS.md` changed that day, which the shared conversation of 0.1.2 never saw; both answers landed in their
 documents.
 
+Hermes's plugin OAuth route (16 October 2026, a real Google account, Hermes built from the branch of
+NousResearch/hermes-agent#139985 before it was merged, with an early build of this plugin's move to the route):
+`hermes auth add gemini-voice:google` signed in, a Drive request went out with the token Hermes attached, and
+Hermes refreshed the token both on command and when it was about to expire.
+
 Covered by the unit tests and the engine contract test, not yet live: objects from other accounts are ignored,
-approvals, exactly once across a restart, a revoked token, a schedule set by voice.
+approvals, exactly once across a restart, a revoked sign-in, a schedule set by voice.
 
 ## Requirements
 
-- Hermes Agent **0.21.6 or newer** with the messaging gateway running (the plugin is a gateway platform).
-  Tested live on 0.21.6; the engine contract test (64 checks) passes on 0.21.6, 0.22.0 and 0.22.2. Hermes does
+- Hermes Agent **0.23.0 or newer** with the messaging gateway running (the plugin is a gateway platform).
+  Hermes signs in to Google for the plugin through its plugin OAuth route, which first ships in that release
+  (NousResearch/hermes-agent#141510). On an older Hermes use gemini-voice 0.1.3 (release v0.1.3). Hermes does
   not load platform plugins under `plugins.isolation: host`, so this plugin does not work in that mode
 - The Google account used in the Gemini app on the phone
 - Your own Google Cloud project for that account (free) with the **Google Calendar, Google Drive, Google Docs
@@ -120,22 +127,22 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
    hermes plugins enable gemini-voice
    ```
 
-   Hermes warns that the source is custom, not from its catalog, and asks for the `GEMINI_VOICE_*` values:
-   press Enter, step 2 stores them. The catalog entry is submitted
-   ([NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)) and waits for
-   an OAuth route for plugins ([#139077](https://github.com/NousResearch/hermes-agent/issues/139077)).
+   Hermes warns that the source is custom, not from its catalog, and asks for `GEMINI_VOICE_CLIENT_ID` and
+   `GEMINI_VOICE_CLIENT_SECRET`: paste the client ID and secret of your OAuth client, and Hermes keeps them in
+   its `.env`. The catalog entry is submitted
+   ([NousResearch/hermes-agent#139078](https://github.com/NousResearch/hermes-agent/pull/139078)) and under review.
 
-2. Authorize the plugin's own Google access, once, in a terminal on the Hermes host. Have the OAuth
-   client JSON at hand, or paste the client ID and secret when asked:
+2. Sign in to Google, once, in a terminal on the Hermes host:
 
    ```sh
-   hermes gemini-voice auth --client-secret-file <PATH_TO_CLIENT_JSON>
+   hermes auth add gemini-voice:google
    ```
 
-   The command prints a Google consent link. Open it in a browser signed in to the phone's Google account,
-   allow all four permissions, then copy the address of the page that fails to load (`http://localhost:1/…`)
-   and paste it back. The command stores `GEMINI_VOICE_CLIENT_ID`, `GEMINI_VOICE_CLIENT_SECRET` and
-   `GEMINI_VOICE_REFRESH_TOKEN` in the Hermes `.env` and prints no secrets.
+   Hermes names the Google hosts the token will be sent to, prints Google's consent address and waits for the
+   redirect on a local port; it opens a browser when it can, and on a remote host it prints the SSH tunnel
+   command for that port. Sign in with the phone's Google account and allow all four permissions: Hermes keeps
+   the grant in this profile's `auth.json` only when every one is granted, and refreshes the token itself.
+   `hermes auth status gemini-voice:google` shows the sign-in.
 
 3. Check it and restart the gateway with your usual method:
 
@@ -143,8 +150,8 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
    hermes gemini-voice check
    ```
 
-   Expected: `TOKEN_OK scopes: calendar.events.owned drive.metadata.readonly documents spreadsheets` and
-   `OK` for the Calendar, Drive, Docs and Sheets APIs.
+   Expected: `OK` for the Calendar, Drive, Docs and Sheets APIs. Otherwise `AUTH_FAILED` gives the reason and
+   the fix.
 
 4. Optional settings in `config.yaml` (defaults shown):
 
@@ -173,6 +180,16 @@ approvals, exactly once across a restart, a revoked token, a schedule set by voi
    ```sh
    hermes config set display.platforms.gemini_voice.runtime_footer.enabled false
    ```
+
+### Upgrading from 0.1.x
+
+0.1.x signed in by itself and kept a refresh token in `GEMINI_VOICE_REFRESH_TOKEN`; 0.2.0 leaves that to Hermes.
+
+1. Update Hermes to 0.23.0 or newer, then the plugin to 0.2.0
+2. Sign in once with `hermes auth add gemini-voice:google` (step 2 above): the same OAuth client, a new grant
+   that Hermes holds
+3. Delete the `GEMINI_VOICE_REFRESH_TOKEN` line from the Hermes `.env`: 0.2.0 never reads it
+4. Restart the gateway and run `hermes gemini-voice check`
 
 ## Using it
 
@@ -205,11 +222,16 @@ voice chat itself is not a delivery target. When you ask by voice for something 
 
 ## Safety and disclosure
 
-- **Network:** only Google APIs (Calendar, Drive, Docs, Sheets) and `oauth2.googleapis.com`, once per poll and
-  per task. No telemetry, no other hosts
-- **Credentials:** the plugin uses only its own OAuth client and refresh token from the three
-  `GEMINI_VOICE_*` variables. It never reads another tool's token files. Access tokens stay in memory; the
-  only write of credentials is `hermes gemini-voice auth`, run by you, through Hermes's own `.env` writer
+- **Network:** the plugin's requests go only to the Google Calendar, Drive, Docs and Sheets APIs
+  (`www.googleapis.com`, `docs.googleapis.com`, `sheets.googleapis.com`), once per poll and per task, and only
+  through Hermes. Hermes itself talks to `accounts.google.com` when you sign in and to `oauth2.googleapis.com`
+  to refresh the token. No telemetry, no other hosts
+- **Credentials:** the plugin holds none. It declares its Google client under `oauth:` in `plugin.yaml`; Hermes
+  signs in (`hermes auth add gemini-voice:google`), keeps the grant in the profile's `auth.json`, refreshes it
+  with `GEMINI_VOICE_CLIENT_ID` and `GEMINI_VOICE_CLIENT_SECRET` from its `.env`, and attaches the token only to
+  requests for the three hosts above (`credentialed_provider_request`, which follows no redirect). The plugin
+  reads `GEMINI_VOICE_CLIENT_ID` only to tell whether it is configured, and never reads `auth.json` or another
+  tool's token files
 - **Google scopes:** `calendar.events.owned`, `drive.metadata.readonly`, `documents`, `spreadsheets`. No Gmail,
   no full Drive access. The plugin reads file metadata to find new objects, reads the text of labelled
   objects, and writes only into task objects and the objects its cron delivery creates
@@ -260,20 +282,21 @@ voice chat itself is not a delivery target. When you ask by voice for something 
 - **Digests are never tasks:** documents created by cron delivery carry `[Hermes digest]` in the title and on
   the first line, and events carry a private marker, so an output is never read back as your instruction,
   even if its title contains the label
-- **Unattended:** a revoked or expired token never opens a browser flow. The platform reports
-  `retrying / auth_failed` in the gateway status (`gateway_state.json`, `hermes gateway status`), logs one
-  line, re-checks every 15 minutes, and the gateway keeps running
+- **Unattended:** a missing or revoked sign-in never opens a browser: `hermes auth add` runs only in your
+  terminal, and Hermes refuses it under the gateway and cron. The platform reports `retrying / auth_failed` in
+  the gateway status (`gateway_state.json`, `hermes gateway status`), logs one line, re-checks every 15
+  minutes, and the gateway keeps running; after a new sign-in polling resumes by itself
 
 ## Status and troubleshooting
 
 ```sh
 hermes gemini-voice status   # platform status, last successful poll, task counts (no titles or text)
-hermes gemini-voice check    # token, scopes and the four APIs
+hermes gemini-voice check    # one request to each of the four APIs through the sign-in Hermes holds
 ```
 
 | Status code | Meaning and fix |
 |---|---|
-| `auth_failed` | token revoked, expired or missing a scope: run `hermes gemini-voice auth`, restart the gateway |
+| `auth_failed` | no sign-in, a revoked one, or a missing permission: run `hermes auth add gemini-voice:google`, and polling resumes within 15 minutes. If the status names the client (`oauth_client_id_missing`, `oauth_client_secret_missing`, `invalid_client`, `unauthorized_client`), fix `GEMINI_VOICE_CLIENT_ID` and `GEMINI_VOICE_CLIENT_SECRET` in the Hermes `.env` and restart the gateway |
 | `google_unreachable` | network or Google outage: polling backs off up to 15 minutes; if only one API is down, the others keep working. A task Google does not answer for is retried with growing pauses for about 45 minutes, then closed with a note, written as soon as Google answers again |
 | `api_disabled` | enable the four APIs in the OAuth client's Cloud project |
 
@@ -290,8 +313,9 @@ python -B -m unittest discover -s plugins/gemini-voice/tests -t plugins/gemini-v
 ```
 
 The unit tests run without network and without Hermes, against an in-memory Google stand-in. The optional
-engine contract test loads the plugin through a real Hermes checkout and skips without one (a skip is not a
-pass):
+engine contract test (77 checks) loads the plugin through a real Hermes checkout and skips without one (a skip
+is not a pass). Its route checks drive Hermes's real plugin OAuth route with only the network faked; on a Hermes
+without the route they collapse into one failed check:
 
 ```sh
 GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> GEMINI_VOICE_TEST_ENGINE_PYTHON=<HERMES_PYTHON> \
@@ -308,7 +332,8 @@ GEMINI_VOICE_TEST_ENGINE_ROOT=<HERMES_CHECKOUT> \
 
 ## Project
 
-- `plugins/gemini-voice/`: the plugin (standard library only, no Python dependencies) and its tests
+- `plugins/gemini-voice/`: the plugin (standard library and Hermes's own modules, no Python dependencies of its
+  own) and its tests
 - [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [MIT license](LICENSE)
 
 MIT © 2026 Ilya Balobanov. Independent integration; not an official Google or Nous Research product.

@@ -14,5 +14,7 @@ logs. Use this repository's **Security → Report a vulnerability** (GitHub priv
 Include the affected version, a minimal synthetic reproducer and the impact.
 
 If a token or client secret leaks: revoke the app's access at https://myaccount.google.com/permissions, reset
-the OAuth client secret in Google Cloud Console, run `hermes gemini-voice auth` again and restart the gateway.
-Disable the plugin (`hermes plugins disable gemini-voice`) while you investigate.
+the OAuth client secret in Google Cloud Console and put the new one into `GEMINI_VOICE_CLIENT_SECRET` in the
+Hermes `.env`, sign in again with `hermes auth add gemini-voice:google` and restart the gateway. Disable the
+plugin (`hermes plugins disable gemini-voice`) while you investigate. The token itself lives only in Hermes's
+`auth.json` of the profile; the plugin never holds it.

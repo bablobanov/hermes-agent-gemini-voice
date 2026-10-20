@@ -1,31 +1,27 @@
-"""Minimal Google REST client on the standard library: in-memory OAuth refresh and bounded timeouts.
+"""Minimal Google REST client: every request goes through Hermes's plugin OAuth route, with bounded timeouts.
 
-The plugin never writes tokens at runtime. The refresh token comes from the plugin's own environment
-variables; access tokens live only in this process's memory.
+The plugin holds no token. Its Google client is declared under ``oauth:`` in plugin.yaml; the owner signs in
+once with ``hermes auth add gemini-voice:google``, Hermes keeps the grant in the profile's auth.json, refreshes
+it and attaches the bearer only for the declared hosts (``credentialed_provider_request``,
+NousResearch/hermes-agent#139077).
 """
 
 from __future__ import annotations
 
 import http.client
 import json
-import threading
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-TOKEN_URL = "https://oauth2.googleapis.com/token"
-SCOPES = (
-    "https://www.googleapis.com/auth/calendar.events.owned",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/spreadsheets",
-)
+OAUTH_ID = "google"  # the id of the plugin's entry under oauth: in plugin.yaml
+SIGN_IN = "hermes auth add gemini-voice:google"
 DEFAULT_TIMEOUT = 20.0
-_EXPIRY_MARGIN = 60.0
-_AUTH_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client", "invalid_scope"}
+# Hermes AuthError codes a retry can clear (a token refresh that failed on the network or a 5xx);
+# every other code needs the operator: the client in .env, or a new sign-in.
+_ROUTE_RETRY_CODES = {"oauth_refresh_failed"}
+# Codes fixed in the Hermes .env (the OAuth client of the owner's Google Cloud project), not by signing in again.
+CLIENT_CODES = {"oauth_client_id_missing", "oauth_client_secret_missing", "invalid_client", "unauthorized_client"}
 _RATE_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "RATE_LIMIT_EXCEEDED", "quotaExceeded"}
 _DISABLED_REASONS = {"accessNotConfigured", "SERVICE_DISABLED"}
 # A dropped connection can surface while the body is read (http.client.IncompleteRead), not only as OSError.
@@ -49,6 +45,10 @@ class AuthError(GoogleError):
     """Authorization is unusable (revoked, expired, wrong client, missing scope): needs the operator."""
 
 
+class SignInError(AuthError):
+    """Hermes refused before sending anything: no sign-in, a revoked one, or a client it cannot use."""
+
+
 class TransientError(GoogleError):
     """Network failure, rate limit or server error: retry later."""
 
@@ -62,20 +62,6 @@ class Response:
     status: int
     body: Any
     headers: Mapping[str, str] = field(default_factory=dict)
-
-
-def urllib_transport(
-    method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float,
-) -> Tuple[int, Dict[str, str], bytes]:
-    """Plain HTTPS request; HTTP errors come back as a status, network errors raise ``OSError`` or
-    ``http.client.HTTPException`` (a connection dropped while the body is read)."""
-    request = urllib.request.Request(url, data=body, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers.items()), resp.read()
-    except urllib.error.HTTPError as exc:
-        payload = exc.read() if exc.fp is not None else b""
-        return exc.code, dict(exc.headers.items()) if exc.headers else {}, payload or b""
 
 
 def _parse_json(raw: bytes) -> Any:
@@ -99,63 +85,67 @@ def _error_reasons(body: Any) -> Tuple[List[str], str]:
     return reasons, str(error.get("message") or "")[:200]
 
 
-class TokenSource:
-    """Exchanges the plugin's own refresh token for short-lived access tokens, cached in memory."""
+def _route_error(exc: Exception, not_signed_in: type, hermes_auth_error: type, network: tuple) -> GoogleError:
+    """Hermes's refusal or failure as the plugin's error: the operator must act, or a retry will do.
 
-    def __init__(
-        self, client_id: str, client_secret: str, refresh_token: str,
-        transport: Transport = urllib_transport, clock: Callable[[], float] = time.monotonic,
-        timeout: float = DEFAULT_TIMEOUT,
-    ):
-        self._form = {"client_id": client_id, "client_secret": client_secret,
-                      "refresh_token": refresh_token, "grant_type": "refresh_token"}
-        self._transport, self._clock, self._timeout = transport, clock, timeout
-        self._lock = threading.Lock()
-        self._token: Optional[str] = None
-        self._expires_at = 0.0
-        self.granted_scopes: Tuple[str, ...] = ()
+    Hermes rebuilds every error past its checks without traceback, chain or request, so none carries a token.
+    The texts Hermes writes itself are kept (they name the fix, e.g. ``hermes auth add ...``, and never echo
+    the token endpoint's body); a network or unexpected failure keeps only its type."""
+    if isinstance(exc, not_signed_in):  # no grant, a revoked one, or an oauth: entry changed since sign-in
+        return SignInError("not_signed_in", str(exc)[:300])
+    if isinstance(exc, hermes_auth_error):
+        code = str(getattr(exc, "code", "") or "hermes_auth_error")
+        # Hermes words these itself and never echoes the token endpoint's body.
+        return (TransientError if code in _ROUTE_RETRY_CODES else SignInError)(code, str(exc)[:300])
+    if isinstance(exc, TimeoutError):  # Hermes waited too long for its auth store lock; an OSError, so first
+        return TransientError("auth_store_busy", "the Hermes auth store stayed locked")
+    if isinstance(exc, (PermissionError, ValueError)):  # a host outside oauth: hosts, or a broken oauth: block
+        return SignInError("route_refused", f"{type(exc).__name__}: {str(exc)[:300]}")
+    if isinstance(exc, network):
+        return TransientError("network", type(exc).__name__)
+    return SignInError("route_failed", type(exc).__name__)
 
-    def token(self) -> str:
-        """A valid access token, refreshed when missing or about to expire."""
-        with self._lock:
-            if self._token is None or self._clock() >= self._expires_at - _EXPIRY_MARGIN:
-                self._refresh()
-            assert self._token is not None
-            return self._token
 
-    def invalidate(self) -> None:
-        with self._lock:
-            self._token = None
+def auth_fix(code: str) -> str:
+    """What the operator does about an authorization failure with this code; never a secret or a token."""
+    if code in CLIENT_CODES:
+        return ("check GEMINI_VOICE_CLIENT_ID and GEMINI_VOICE_CLIENT_SECRET in the Hermes .env, then restart the "
+                "gateway")
+    if code in ("not_signed_in", "insufficient_scope"):
+        return f"run `{SIGN_IN}` on the Hermes host and allow all four permissions; polling resumes by itself"
+    if code == "unauthorized":
+        return ("nothing at first: Hermes refreshes the token when it expires and polling retries every 15 minutes "
+                "(`hermes auth refresh gemini-voice:google` refreshes it now); if it keeps failing, "
+                f"run `{SIGN_IN}`")
+    if code == "hermes_too_old":
+        return "update Hermes to a release with the plugin OAuth route"
+    # route_refused, route_failed, invalid_scope and anything new: a new sign-in would not help
+    return "check that this Hermes release supports this version of the plugin (the reason is above)"
 
-    def _refresh(self) -> None:
-        body = urllib.parse.urlencode(self._form).encode("ascii")
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-        try:
-            status, _, raw = self._transport("POST", TOKEN_URL, headers, body, self._timeout)
-        except _NETWORK_ERRORS as exc:
-            raise TransientError("network", type(exc).__name__) from None
-        payload = _parse_json(raw)
-        if status == 200 and isinstance(payload, dict) and payload.get("access_token"):
-            self._token = str(payload["access_token"])
-            self._expires_at = self._clock() + float(payload.get("expires_in") or 3600)
-            self.granted_scopes = tuple(str(payload.get("scope") or "").split())
-            return
-        self._raise_refresh_error(status, payload)
 
-    @staticmethod
-    def _raise_refresh_error(status: int, payload: Any) -> None:
-        code = str(payload.get("error") or "") if isinstance(payload, dict) else ""
-        if code in _AUTH_ERRORS or status in (400, 401):
-            raise AuthError(code or f"http_{status}", "token refresh refused", status)
-        raise TransientError(f"http_{status}", "token endpoint unavailable", status)
+def hermes_transport(
+    method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float,
+) -> Tuple[int, Dict[str, str], bytes]:
+    """Send through Hermes's route for the plugin's ``oauth:`` entry: Hermes attaches the token, refreshes it,
+    sends only to the declared hosts and follows no redirect. The plugin never receives the token."""
+    try:
+        import httpx
+        from hermes_cli.auth_constants import AuthError as HermesAuthError
+        from hermes_cli.plugin_provider_requests import ProviderNotSignedIn, credentialed_provider_request
+    except ImportError as exc:
+        raise SignInError("hermes_too_old", f"this Hermes has no plugin OAuth route ({exc.name})") from None
+    try:
+        resp = credentialed_provider_request(OAUTH_ID, method, url, json=json.loads(body) if body else None,
+                                             headers=headers, timeout=timeout)
+    except Exception as exc:
+        raise _route_error(exc, ProviderNotSignedIn, HermesAuthError, (OSError, httpx.HTTPError)) from None
+    return resp.status, dict(resp.headers), resp.body
 
 
 class GoogleClient:
-    """JSON requests with a bearer token; one transparent retry after a 401."""
+    """JSON requests to Google. The default transport is Hermes's OAuth route; tests pass a fake one."""
 
-    def __init__(self, tokens: TokenSource, transport: Transport = urllib_transport,
-                 timeout: float = DEFAULT_TIMEOUT):
-        self.tokens = tokens
+    def __init__(self, transport: Transport = hermes_transport, timeout: float = DEFAULT_TIMEOUT):
         self._transport = transport
         self._timeout = timeout
 
@@ -163,17 +153,13 @@ class GoogleClient:
                 body: Any = None, headers: Optional[Mapping[str, str]] = None) -> Response:
         full_url = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-        for attempt in (1, 2):
-            sent_headers = {"Authorization": f"Bearer {self.tokens.token()}", "Accept": "application/json"}
-            if data is not None:
-                sent_headers["Content-Type"] = "application/json; charset=utf-8"
-            sent_headers.update(headers or {})
-            status, resp_headers, raw = self._send(method, full_url, sent_headers, data)
-            if status == 401 and attempt == 1:
-                self.tokens.invalidate()
-                continue
-            return self._check(status, resp_headers, raw)
-        raise AuthError("unauthorized", "access token rejected twice", 401)  # pragma: no cover
+        sent_headers = {"Accept": "application/json"}
+        if data is not None:
+            sent_headers["Content-Type"] = "application/json; charset=utf-8"
+        sent_headers.update(headers or {})
+        # A 401 is final: Hermes refreshes the grant by its expiry, and a revoked one fails the next refresh.
+        status, resp_headers, raw = self._send(method, full_url, sent_headers, data)
+        return self._check(status, resp_headers, raw)
 
     def _send(self, method: str, url: str, headers: Dict[str, str],
               data: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
