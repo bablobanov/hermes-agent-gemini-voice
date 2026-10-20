@@ -619,7 +619,7 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         "route: Hermes refreshes with the client from .env and keeps the refresh token": [
             getattr(refreshed, "status", 0) == 200 and one_request(refreshed_sent, "GET", drive, "probe-access-2")
             and kept_refresh == "probe-refresh" and one_token_post(refresh_posts),
-            f"sent {len(refreshed_sent)} {[(p['url'], sorted(p['data'])) for p in refresh_posts]}"],
+            f"sent {len(refreshed_sent)} {[(p['url'], repr(p.get('data'))[:80]) for p in refresh_posts]}"],
         "route: a refused refresh is a revoked sign-in": [
             code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant"
             and nothing(revoked_sent) and one_token_post(revoked_posts), str(revoked)],
