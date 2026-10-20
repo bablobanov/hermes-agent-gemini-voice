@@ -1,16 +1,17 @@
 name: gemini-voice
 label: Gemini Voice
 kind: platform
-version: 0.1.3
+version: 0.2.0
 description: >
   Give Hermes a task on Android without opening a messenger: call Gemini with its button, even from the lock
   screen, and say it in one sentence, e.g. "create a document Hermes ... and put the text in it: ..." (or an
-  event, or a sheet). Hermes writes the reply into that same Google object and Gemini reads it aloud. Uses the
-  plugin's own Google OAuth token and only objects the account owner created.
+  event, or a sheet). Hermes writes the reply into that same Google object and Gemini reads it aloud. Hermes
+  signs in to Google for the plugin (`hermes auth add gemini-voice:google`) and keeps and refreshes the token;
+  the plugin never holds it. Only objects the account owner created become tasks.
 author: Ilya Balobanov
 license: MIT
 homepage: https://github.com/bablobanov/hermes-agent-gemini-voice
-requires_hermes: ">=0.21.6"
+requires_hermes: ">=0.23.0"  # the first release with the plugin OAuth route (NousResearch/hermes-agent#141510)
 provides_hooks:
   - pre_tool_call
 requires_env:
@@ -20,18 +21,27 @@ requires_env:
     url: "https://console.cloud.google.com/apis/credentials"
     password: false
   - name: GEMINI_VOICE_CLIENT_SECRET
-    description: "OAuth client secret of the same client"
+    description: "OAuth client secret of the same client; Hermes reads it to sign in and to refresh the token"
     prompt: "Google OAuth client secret"
-    password: true
-  - name: GEMINI_VOICE_REFRESH_TOKEN
-    description: "The plugin's own refresh token, written by `hermes gemini-voice auth`"
-    prompt: "Refresh token (leave empty and run `hermes gemini-voice auth`)"
     password: true
 optional_env:
   - name: GEMINI_VOICE_HOME_CHANNEL
     description: "Target of a bare `deliver: gemini_voice`: doc (a new document) or event-HHMM. Unset by default: it also becomes the home channel that Hermes's own notices go to"
     prompt: "Default cron delivery target"
     password: false
+oauth:
+  - id: google
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/calendar.events.owned
+      - https://www.googleapis.com/auth/drive.metadata.readonly
+      - https://www.googleapis.com/auth/documents
+      - https://www.googleapis.com/auth/spreadsheets
+    client_id_env: GEMINI_VOICE_CLIENT_ID
+    client_secret_env: GEMINI_VOICE_CLIENT_SECRET
+    hosts: [www.googleapis.com, docs.googleapis.com, sheets.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
 config_schema:
   labels:
     type: list

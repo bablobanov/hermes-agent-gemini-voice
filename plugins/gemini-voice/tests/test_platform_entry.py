@@ -7,8 +7,7 @@ from unittest import mock
 
 from _load import load
 
-CREDENTIALS = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
-               "GEMINI_VOICE_REFRESH_TOKEN": "token"}
+CREDENTIALS = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret"}
 
 
 class HomeChannelTests(unittest.TestCase):
@@ -32,6 +31,14 @@ class HomeChannelTests(unittest.TestCase):
             home = self.enablement(GEMINI_VOICE_HOME_CHANNEL="event-2561")["home_channel"]
         self.assertEqual(home["chat_id"], "doc")
         self.assertIn("GEMINI_VOICE_HOME_CHANNEL", logs.output[0])
+
+    def test_configured_by_the_client_id_alone(self):
+        # The grant lives in Hermes's auth.json, not in .env: the plugin neither reads nor checks it.
+        package = load("")
+        with mock.patch.object(package, "_read_secret", lambda name: "id" if name == "GEMINI_VOICE_CLIENT_ID" else None):
+            self.assertTrue(package._is_connected())
+        with mock.patch.object(package, "_read_secret", lambda name: None):
+            self.assertFalse(package._is_connected())
 
     def test_not_configured_without_credentials(self):
         package = load("")

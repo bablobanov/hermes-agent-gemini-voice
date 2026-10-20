@@ -1,7 +1,9 @@
 """In-memory stand-in for the Google endpoints the plugin calls, used as the HTTP transport in tests.
 
-It enforces the contracts that matter to the plugin: ``If-Match`` etags on event patches, Docs
-``requiredRevisionId``, Sheets ``valueInputOption``, OAuth refresh errors and 401 handling.
+It stands where Hermes's plugin OAuth route stands in production: the plugin must never send its own
+``Authorization`` header, and ``refusal`` plays a refusal of the route (no sign-in, a revoked one) that
+happens before anything is sent. It enforces the contracts that matter to the plugin: ``If-Match`` etags on
+event patches, Docs ``requiredRevisionId``, Sheets ``valueInputOption``.
 """
 
 from __future__ import annotations
@@ -12,17 +14,10 @@ import urllib.parse
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-TOKEN_URL = "https://oauth2.googleapis.com/token"
 CAL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 DRIVE = "https://www.googleapis.com/drive/v3/files"
 DOCS = "https://docs.googleapis.com/v1/documents"
 SHEETS = "https://sheets.googleapis.com/v4/spreadsheets"
-ALL_SCOPES = " ".join([
-    "https://www.googleapis.com/auth/calendar.events.owned",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/spreadsheets",
-])
 
 Reply = Tuple[int, Dict[str, str], bytes]
 
@@ -46,7 +41,7 @@ class FakeGoogle:
         self.docs: Dict[str, Dict[str, Any]] = {}
         self.sheets: Dict[str, List[List[str]]] = {}
         self.calls: List[Tuple[str, str, Dict[str, str], Any]] = []
-        self.revoked = False
+        self.refusal: Optional[Exception] = None  # raised before anything is sent, as Hermes's route does
         self.offline = False
         self.fail_writes = False
         self.fail_cell_writes = False  # writing cell values fails (a values PUT, or a batchUpdate that writes cells)
@@ -56,9 +51,6 @@ class FakeGoogle:
         self.cal_page_size = 250
         self.drive_page_size = 100
         self.refuse: Dict[Tuple[str, str], Tuple[int, str]] = {}  # (method, url) -> (status, reason)
-        self.reject_access_once = False
-        self.token_scope = ALL_SCOPES
-        self.refreshes = 0
         self.sheet_writes: List[Dict[str, Any]] = []
         self._seq = 0
         self._etag = 0
@@ -109,6 +101,10 @@ class FakeGoogle:
 
     # ------------------------------------------------------------------ transport
     def __call__(self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float) -> Reply:
+        if any(name.lower() == "authorization" for name in headers):
+            raise AssertionError("the plugin sent its own Authorization header; Hermes attaches the token")
+        if self.refusal is not None:
+            raise self.refusal
         if self.offline:
             raise OSError("network down")
         parsed = urllib.parse.urlparse(url)
@@ -121,13 +117,6 @@ class FakeGoogle:
         self.calls.append((method, base, params, payload))
         if any(base.startswith(prefix) for prefix in self.offline_urls):
             raise OSError("timed out")
-        if base == TOKEN_URL:
-            return self._token(payload or {})
-        if headers.get("Authorization") != "Bearer at-1":
-            return _error(401, "authError")
-        if self.reject_access_once:
-            self.reject_access_once = False
-            return _error(401, "authError")
         if self.fail_writes and method != "GET":
             return _error(503, "backendError")
         if (method, base) in self.refuse:
@@ -139,12 +128,6 @@ class FakeGoogle:
             self.lose_response_once = None
             raise OSError("timed out")  # Google applied the request; its answer never arrived
         return reply
-
-    def _token(self, form: Dict[str, str]) -> Reply:
-        self.refreshes += 1
-        if self.revoked:
-            return _json(400, {"error": "invalid_grant", "error_description": "Token has been expired or revoked."})
-        return _json(200, {"access_token": "at-1", "expires_in": 3600, "scope": self.token_scope})
 
     def _route(self, method: str, base: str, params: Dict[str, str], payload: Any, headers: Dict[str, str]) -> Reply:
         routes: List[Tuple[str, str, Callable[..., Reply]]] = [

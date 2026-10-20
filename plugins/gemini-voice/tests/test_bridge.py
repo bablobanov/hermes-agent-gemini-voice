@@ -52,7 +52,7 @@ class Harness:
         self.refuse = False
         params = {"labels": ["Афон*"], "language": "ru", "timezone": "UTC"}
         params.update(settings)
-        client = api.GoogleClient(api.TokenSource("a", "b", "c", transport=self.fake), transport=self.fake)
+        client = api.GoogleClient(transport=self.fake)
         self.bridge = bridge_mod.VoiceBridge(
             bridge_mod.Settings(**params), client, self.store, self._dispatch,
             lambda state, code, message: self.statuses.append((state, code)),
@@ -742,28 +742,38 @@ class ExactlyOnceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnattendedTests(unittest.IsolatedAsyncioTestCase):
-    async def test_revoked_token_pauses_cleanly_and_reports_status(self):
+    async def test_revoked_sign_in_pauses_cleanly_and_reports_status(self):
         h = Harness()
         await h.bridge.tick()
-        h.fake.revoked = True
+        h.fake.refusal = api.SignInError("not_signed_in", "The google sign-in for plugin 'gemini-voice' was revoked "
+                                         "(invalid_grant). Run `hermes auth add gemini-voice:google` to sign in again.")
         h.fake.add_doc("Афоня", "x", created=h.later(minutes=1))
-        h.bridge.calendar.client.tokens.invalidate()
         with self.assertLogs("gemini_voice", "ERROR") as logs:
             delay = await h.bridge.tick()
         self.assertEqual(delay, 60.0)
         self.assertEqual(h.statuses[-1], ("retrying", "auth_failed"))
-        self.assertIn("hermes gemini-voice auth", logs.output[0])
+        self.assertIn("hermes auth add gemini-voice:google", logs.output[0])
+        self.assertIn("resumes by itself", logs.output[0])  # the grant is read per request: no restart
         self.assertEqual(h.dispatched, [])
         calls = len(h.fake.calls)
         h.later(minutes=5)
         await h.bridge.tick()  # inside the 15-minute recheck window: no Google traffic at all
         self.assertEqual(len(h.fake.calls), calls)
         self.assertEqual(h.store.get("journal")["status"]["code"], "auth_failed")
-        h.fake.revoked = False
+        h.fake.refusal = None  # the owner signed in again; the same client keeps going
         h.later(minutes=11)
         await h.bridge.tick()
         self.assertEqual(h.statuses[-1], ("connected", ""))
         self.assertEqual(len(h.dispatched), 1)
+
+    async def test_a_client_problem_points_to_the_env_not_to_a_new_sign_in(self):
+        h = Harness()
+        h.fake.refusal = api.SignInError("oauth_client_secret_missing", "GEMINI_VOICE_CLIENT_SECRET is not set.")
+        with self.assertLogs("gemini_voice", "ERROR") as logs:
+            await h.bridge.tick()
+        self.assertEqual(h.statuses[-1], ("retrying", "auth_failed"))
+        self.assertIn("GEMINI_VOICE_CLIENT_SECRET in the Hermes .env", logs.output[0])
+        self.assertNotIn("hermes auth add", logs.output[0])
 
     async def test_network_outage_backs_off(self):
         h = Harness()

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from . import textutil
-from .google_api import ApiError, AuthError, GoogleClient, GoogleError, TransientError
+from .google_api import CLIENT_CODES, SIGN_IN, ApiError, AuthError, GoogleClient, GoogleError, TransientError
 from .journal import Journal, Store, from_iso, iso
 from .sources import (DEEP_PAGES, MAX_PAGES, Calendar, CalendarOutput, Docs, Drive, Locator, Sheets, Verdict,
                       event_text, judge_event, own_suffixes, plan_event_write)
@@ -768,8 +768,10 @@ class VoiceBridge:
         self._set_status("retrying", code, message)
 
     def _on_auth_error(self, exc: AuthError, now: datetime) -> float:
-        message = (f"Google authorization failed ({exc.code}); polling paused. Run `hermes gemini-voice auth` "
-                   "on the server, then restart the gateway.")
+        fix = ("check GEMINI_VOICE_CLIENT_ID and GEMINI_VOICE_CLIENT_SECRET in the Hermes .env, then restart the "
+               "gateway" if exc.code in CLIENT_CODES else
+               f"run `{SIGN_IN}` on the Hermes host; polling resumes by itself within 15 minutes")
+        message = f"Google authorization failed ({exc.code}); polling paused. To fix it, {fix}."
         if self._auth_failed_at is None:
             logger.error("gemini-voice: %s", message)
         self._auth_failed_at = now

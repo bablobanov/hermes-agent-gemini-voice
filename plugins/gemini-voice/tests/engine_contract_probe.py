@@ -10,14 +10,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 
 
 def install(plugin_dir: Path, home: Path) -> None:
-    shutil.copytree(plugin_dir, home / "plugins" / "gemini-voice",
-                    ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    target = home / "plugins" / "gemini-voice"
+    shutil.copytree(plugin_dir, target, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    # A checkout of Hermes between releases reports the last release and would skip a plugin that needs the next
+    # one before loading it. The probe tests the code against this checkout; route_checks tests the gate itself.
+    manifest = target / "plugin.yaml"
+    manifest.write_text(re.sub(r"(?m)^requires_hermes:.*\n", "", manifest.read_text(encoding="utf-8")),
+                        encoding="utf-8")
     (home / "config.yaml").write_text("plugins:\n  enabled:\n    - gemini-voice\n", encoding="utf-8")
 
 
@@ -165,7 +171,7 @@ def stateful_checks(adapter, package: str) -> dict:
               "state": "dispatched", "dispatched_at": now.isoformat(), "turn_open": True}
     store = DictStore({"journal": {"version": 1, "since": (now - timedelta(hours=1)).isoformat(),
                                    "objects": {key: record}}})
-    client = api.GoogleClient(api.TokenSource("a", "b", "c", transport=fake), transport=fake)
+    client = api.GoogleClient(transport=fake)
 
     async def no_dispatch(_task):
         raise RuntimeError("no new task in this check")
@@ -214,7 +220,7 @@ def ledger_checks(adapter_factory, package: str, home: Path) -> dict:
 
     def process():
         adapter = adapter_factory(PlatformConfig(enabled=True))
-        client = api.GoogleClient(api.TokenSource("a", "b", "c", transport=fake), transport=fake)
+        client = api.GoogleClient(transport=fake)
         adapter._bridge = bridge_mod.VoiceBridge(bridge_mod.Settings(labels=["Hermes"]), client, store, dispatch,
                                                  lambda *_: None, clock=lambda: now[0], run_blocking=inline)
         return adapter, adapter._bridge
@@ -302,11 +308,10 @@ def cron_checks(entry, package: str) -> dict:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from fake_google import FakeGoogle
     api, fake = import_module(package + ".google_api"), FakeGoogle()
-    real_client, real_tokens = api.GoogleClient, api.TokenSource
-    api.GoogleClient = lambda tokens, **_: real_client(tokens, transport=fake)
-    api.TokenSource = lambda *args, **_: real_tokens(*args, transport=fake)
+    real_client = api.GoogleClient
+    api.GoogleClient = lambda *_, **__: real_client(transport=fake)
     names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
-             "GEMINI_VOICE_REFRESH_TOKEN": "token", "GEMINI_VOICE_HOME_CHANNEL": "event-2561"}
+             "GEMINI_VOICE_HOME_CHANNEL": "event-2561"}
     saved = {name: os.environ.get(name) for name in names}
     os.environ.update(names)
     send = entry.standalone_sender_fn
@@ -321,7 +326,7 @@ def cron_checks(entry, package: str) -> dict:
         os.environ["GEMINI_VOICE_HOME_CHANNEL"] = "doc"
         named = enabled_platform(entry)
     finally:
-        api.GoogleClient, api.TokenSource = real_client, real_tokens
+        api.GoogleClient = real_client
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -363,7 +368,7 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
     from gateway.config import Platform
     api, textutil = import_module(package + ".google_api"), import_module(package + ".textutil")
     split_title = import_module(package + ".bridge").split_title
-    real_client, real_tokens = api.GoogleClient, api.TokenSource
+    real_client = api.GoogleClient
     secret = "ghp_" + "Ab3" * 12
     output = ("Briefing\n\nmail: 3 letters, token " + secret + "\n"
               'To stop or manage this job, send me a new message (e.g. "x"). Quoted by the job itself')
@@ -374,8 +379,7 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
     def job(target: str) -> dict:
         return {"id": "job1", "name": "Briefing job", "deliver": f"gemini_voice:{target}"}
 
-    names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret",
-             "GEMINI_VOICE_REFRESH_TOKEN": "token"}
+    names = {"GEMINI_VOICE_CLIENT_ID": "id", "GEMINI_VOICE_CLIENT_SECRET": "secret"}
     stub, previous = StubBridge(), adapter._bridge
     with ExitStack() as stack:
         stack.enter_context(mock.patch.object(sys, "path", [str(Path(__file__).resolve().parent)] + sys.path))
@@ -383,9 +387,7 @@ def cron_wrapper_checks(adapter, package: str) -> dict:
         fake = FakeGoogle()
         stack.enter_context(mock.patch.dict(os.environ, names))
         os.environ.pop("GEMINI_VOICE_HOME_CHANNEL", None)  # restored with the rest when the stack closes
-        stack.enter_context(mock.patch.object(api, "GoogleClient",
-                                              lambda tokens, **_: real_client(tokens, transport=fake)))
-        stack.enter_context(mock.patch.object(api, "TokenSource", lambda *a, **_: real_tokens(*a, transport=fake)))
+        stack.enter_context(mock.patch.object(api, "GoogleClient", lambda *_, **__: real_client(transport=fake)))
         standalone_event = delivery._deliver_result(job("event-0800"), output)
         standalone_doc = delivery._deliver_result(job("doc"), output)
         loop = asyncio.new_event_loop()
@@ -452,7 +454,158 @@ def busy_checks(adapter) -> dict:
     return results
 
 
-def probe() -> dict:
+def _link(target: Path, link: Path) -> str:
+    """A directory link the way a checkout is often installed (``ln -s``); a junction where Windows allows no symlink."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return "symlink"
+    except OSError:
+        import _winapi  # Windows only: a junction needs no privilege
+        _winapi.CreateJunction(str(target), str(link))
+        return "junction"
+
+
+def route_checks(package: str, home: Path, source_dir: Path) -> dict:
+    """Hermes's plugin OAuth route around the plugin loaded by the real loader. Only the network is faked: Google
+    and the token endpoint answer in memory. A grant is written the way ``hermes auth add`` writes it."""
+    import importlib.util
+    import time
+    from contextlib import ExitStack
+    from importlib import import_module
+    from unittest import mock
+    import httpx
+    try:
+        from hermes_cli import plugin_oauth
+    except ImportError as exc:  # a release before NousResearch/hermes-agent#141510
+        return {"route: this Hermes has the plugin OAuth route": [False, str(exc)]}
+    from hermes_cli.plugins_manifest import version_satisfies
+    from pm.plugin_declarations import read_native_manifest
+    api = import_module(package + ".google_api")
+    drive, docs = "https://www.googleapis.com/drive/v3/files", "https://docs.googleapis.com/v1/documents/d1:batchUpdate"
+    manifest = read_native_manifest(source_dir / "plugin.yaml")
+    clients, problems = plugin_oauth.parse_oauth_clients(manifest)
+    problems += plugin_oauth.oauth_admission_problems(manifest, source_dir)
+    warnings = plugin_oauth.oauth_admission_warnings(manifest, source_dir)  # the whole tree, tests included
+    spec = str(manifest.get("requires_hermes") or "")
+    installed = home / "plugins" / "gemini-voice"
+    # The entry as written, even if Hermes refuses it: the grant then carries its real fingerprint.
+    client = plugin_oauth._client(read_native_manifest(installed / "plugin.yaml")["oauth"][0])
+    key = f"{plugin_oauth.plugin_key(installed)}:{client.id}"
+    canary = "probe-client-secret-canary"
+    sent: list = []
+    google = {"status": 200}
+    posts: list = []
+    token = {"status": 200, "body": {}}
+    real_client = httpx.Client
+
+    def answer(request):
+        sent.append(request)
+        return httpx.Response(google["status"], json={"ok": True} if google["status"] == 200 else {"error": {}})
+
+    def offline_client(*args, **kwargs):
+        return real_client(*args, **{**kwargs, "transport": httpx.MockTransport(answer)})
+
+    def token_post(url, data=None, **_):
+        posts.append(dict(data or {}))
+        return httpx.Response(token["status"], json=token["body"], request=httpx.Request("POST", url))
+
+    def grant(**row):
+        plugin_oauth._write_grant(key, {"access_token": "probe-access", "refresh_token": "probe-refresh",
+                                        "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+                                        "fingerprint": client.fingerprint, **row})
+
+    def call(method="GET", url=drive, module=api, **kwargs):
+        try:
+            return module.GoogleClient().request(method, url, **kwargs)
+        except Exception as exc:  # the plugin's own errors: GoogleError of whichever module sent the request
+            return exc
+
+    expired = {"expires_at_ms": int(time.time() * 1000) - 1000}
+    env = {"GEMINI_VOICE_CLIENT_ID": "probe-client-id", "GEMINI_VOICE_CLIENT_SECRET": canary}
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(httpx, "Client", offline_client))
+        stack.enter_context(mock.patch.object(httpx, "post", token_post))
+        stack.enter_context(mock.patch.dict(os.environ, env))
+        unsigned = call()
+        unsigned_sent = len(sent)
+        grant()
+        ok = call("POST", docs, body={"requests": [{"insertText": {"text": "Привет"}}]}, headers={"If-Match": "e1"})
+        first = sent[0] if sent else None
+        after_ok = len(sent)
+        off_list = call(url="https://example.com/x")
+        after_off = len(sent)
+        google["status"] = 401
+        rejected = call()
+        after_401 = len(sent)
+        google["status"], before = 200, len(sent)
+        grant(**expired)
+        token.update(status=503, body={"error": "backend"})
+        flaky = call()
+        flaky_sent = len(sent) - before
+        token.update(status=200, body={"access_token": "probe-access-2", "expires_in": 3600})
+        refreshed = call()
+        refreshed_auth = sent[-1].headers.get("authorization") if sent else ""
+        kept_refresh = plugin_oauth._read_grant(key).get("refresh_token")
+        refresh_form = posts[-1] if posts else {}
+        grant(**expired)
+        token.update(status=400, body={"error": "invalid_grant"})
+        revoked = call()
+        dead = (plugin_oauth._read_grant(key) or {}).get("dead")
+        grant(**expired)
+        os.environ.pop("GEMINI_VOICE_CLIENT_ID")
+        no_client = call()
+        os.environ["GEMINI_VOICE_CLIENT_ID"] = env["GEMINI_VOICE_CLIENT_ID"]
+        link = home / "plugins" / "gemini-voice-link"
+        link_kind = _link(source_dir, link)
+        stack.callback(lambda: link.unlink() if link_kind == "symlink" else os.rmdir(link))
+        spec_link = importlib.util.spec_from_file_location("gemini_voice_link_google_api", link / "google_api.py")
+        linked = importlib.util.module_from_spec(spec_link)
+        stack.enter_context(mock.patch.dict(sys.modules, {spec_link.name: linked}))  # dataclasses look it up
+        spec_link.loader.exec_module(linked)
+        through_link = call(module=linked)
+    texts = " ".join(str(x) for x in (unsigned, off_list, rejected, flaky, revoked, no_client, through_link))
+
+    def code(result):
+        return getattr(result, "code", repr(result))
+
+    return {
+        "route: Hermes admits the oauth: entry": [
+            len(clients) == 1 and clients[0].id == api.OAUTH_ID and not problems, repr(problems)],
+        "route: no reviewer warning, tests included": [warnings == [], repr(warnings)],
+        "route: requires_hermes excludes every release without the route": [
+            bool(spec) and not any(version_satisfies(spec, v) for v in ("0.21.6", "0.22.0", "0.22.1", "0.22.2")), spec],
+        "route: no sign-in, nothing sent, the command named": [
+            isinstance(unsigned, api.SignInError) and unsigned.code == "not_signed_in" and unsigned_sent == 0
+            and api.SIGN_IN in str(unsigned), str(unsigned)],
+        "route: Hermes attaches the bearer, the plugin's body and headers arrive": [
+            getattr(ok, "body", None) == {"ok": True} and first is not None
+            and first.headers.get("authorization") == "Bearer probe-access" and first.headers.get("if-match") == "e1"
+            and json.loads(first.content) == {"requests": [{"insertText": {"text": "Привет"}}]},
+            repr(first.headers if first is not None else ok)],
+        "route: a host outside oauth: hosts is refused before sending": [
+            code(off_list) == "route_refused" and "PermissionError" in str(off_list) and after_off == after_ok,
+            f"{after_ok}->{after_off} {off_list}"],
+        "route: a 401 is one request and an auth error": [
+            code(rejected) == "unauthorized" and after_401 == after_off + 1, f"{after_off}->{after_401} {rejected}"],
+        "route: a refresh that fails is retried later, Google not called": [
+            isinstance(flaky, api.TransientError) and code(flaky) == "oauth_refresh_failed" and flaky_sent == 0,
+            str(flaky)],
+        "route: Hermes refreshes with the client from .env and keeps the refresh token": [
+            getattr(refreshed, "status", 0) == 200 and refreshed_auth == "Bearer probe-access-2"
+            and kept_refresh == "probe-refresh" and refresh_form.get("grant_type") == "refresh_token"
+            and refresh_form.get("client_secret") == canary, f"{refreshed_auth} {sorted(refresh_form)}"],
+        "route: a refused refresh is a revoked sign-in": [
+            code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant", str(revoked)],
+        "route: a missing client ID needs the operator": [
+            isinstance(no_client, api.SignInError) and code(no_client) == "oauth_client_id_missing", str(no_client)],
+        "route: no secret or token in the plugin's errors": [
+            all(s not in texts for s in (canary, "probe-access", "probe-refresh")), texts[:300]],
+        "route: a plugin installed through a link is still the caller": [
+            code(through_link) == "not_signed_in", f"{link_kind}: {through_link}"],
+    }
+
+
+def probe(plugin_dir: Path) -> dict:
     from hermes_cli.plugins import discover_plugins, get_plugin_manager, get_pre_tool_call_directive
     from gateway.platform_registry import platform_registry
     from gateway.config import Platform, PlatformConfig
@@ -520,6 +673,8 @@ def probe() -> dict:
                                  Path(os.environ["HERMES_HOME"])))
     results.update(cron_checks(entry, type(adapter).__module__.rsplit(".", 1)[0]))
     results.update(cron_wrapper_checks(adapter, type(adapter).__module__.rsplit(".", 1)[0]))
+    results.update(route_checks(type(adapter).__module__.rsplit(".", 1)[0], Path(os.environ["HERMES_HOME"]),
+                                plugin_dir.resolve()))
 
     tokens = set_session_vars(platform="gemini_voice")
     try:
@@ -544,7 +699,7 @@ def main() -> int:
     sys.path[:] = [*inherited, *(entry for entry in sys.path if entry not in inherited)]
     sys.path.insert(0, str(engine_root))
     install(plugin_dir, Path(os.environ["HERMES_HOME"]))
-    print(json.dumps(probe(), ensure_ascii=False))
+    print(json.dumps(probe(plugin_dir), ensure_ascii=False))
     return 0
 
 

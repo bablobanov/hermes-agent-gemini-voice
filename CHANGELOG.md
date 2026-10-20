@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0
+
+- Hermes signs in to Google for the plugin. The plugin declares its Google client under `oauth:` in
+  `plugin.yaml`; the owner signs in once with `hermes auth add gemini-voice:google`, and Hermes keeps the grant in
+  the profile's `auth.json`, refreshes it and attaches the token only to requests for `www.googleapis.com`,
+  `docs.googleapis.com` and `sheets.googleapis.com` (`credentialed_provider_request`, NousResearch/hermes-agent#141510).
+  The plugin no longer holds, refreshes or writes a token: its own consent flow, token refresh and `.env` writes
+  are gone, and `GEMINI_VOICE_REFRESH_TOKEN` is no longer read
+- Requires Hermes 0.23.0 or newer, the first release with the plugin OAuth route; on an older Hermes use 0.1.3
+- `hermes gemini-voice auth` only points to `hermes auth add gemini-voice:google`; `hermes gemini-voice check`
+  sends one request to each of the four APIs through the sign-in Hermes holds
+- No sign-in, a revoked one, or a client Hermes cannot use is `auth_failed` with the fix in the status; after a
+  new sign-in polling resumes by itself within 15 minutes, without a restart. A token refresh that fails on the
+  network or with a 5xx is retried like any Google outage. A 401 from Google is final: Hermes refreshes the token
+  by its expiry, so the plugin no longer retries
+- Upgrading from 0.1.x: sign in with `hermes auth add gemini-voice:google`, delete `GEMINI_VOICE_REFRESH_TOKEN`
+  from the Hermes `.env`, restart the gateway
+- The engine contract test drives Hermes's real plugin OAuth route with only the network faked (77 checks)
+- README: the diagram says "one session per object" instead of "one chat"
+
 ## 0.1.3
 
 - One object, one session: every voice task (an event, a document or a sheet) is a Hermes session of its own,

@@ -13,9 +13,9 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 from . import textutil
-from .auth_cli import ENV_NAMES
+from .auth_cli import ENV_CLIENT_ID
 from .bridge import OWNER_CHAT, PLATFORM, TEXT_ONLY, Settings, Task, VoiceBridge
-from .google_api import GoogleClient, TokenSource
+from .google_api import SIGN_IN, GoogleClient
 
 logger = logging.getLogger("gemini_voice")
 
@@ -74,12 +74,12 @@ class GeminiVoiceAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._poller is not None and not self._poller.done():
             return True  # one poller (and one journal writer) per adapter
-        credentials = [self._read_secret(name) or "" for name in ENV_NAMES]
-        if not all(credentials):
-            self._set_fatal_error("not_configured", "Google access is not configured: run `hermes gemini-voice "
-                                  "auth` on the server, then restart the gateway.", retryable=False)
+        if not self._read_secret(ENV_CLIENT_ID):
+            self._set_fatal_error("not_configured", f"Google access is not configured: set {ENV_CLIENT_ID} and "
+                                  f"GEMINI_VOICE_CLIENT_SECRET in the Hermes .env, run `{SIGN_IN}` on the server, "
+                                  "then restart the gateway.", retryable=False)
             return False
-        client = GoogleClient(TokenSource(*credentials))
+        client = GoogleClient()
         self._bridge = VoiceBridge(self._settings, client, self._store, self._dispatch, self._publish,
                                    session_busy=self._owner_session_busy)
         self._poller = asyncio.create_task(self._bridge.run_forever(), name="gemini-voice-poller")

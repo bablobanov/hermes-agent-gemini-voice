@@ -8,7 +8,7 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
-from .auth_cli import ENV_NAMES, default_io, handle, setup_parser
+from .auth_cli import ENV_CLIENT_ID, ENV_NAMES, default_io, handle, setup_parser
 from .bridge import PLATFORM, TEXT_ONLY, Settings, Task, VoiceBridge, valid_target
 from .journal import NullStore
 
@@ -54,13 +54,10 @@ def _read_secret(name: str) -> Optional[str]:
     return str(value).strip() if value else None
 
 
-def _save_env(name: str, value: str) -> None:
-    from hermes_cli.config import save_env_value_secure
-    save_env_value_secure(name, value)
-
-
 def _is_connected(_config: Any = None) -> bool:
-    return all(_read_secret(name) for name in ENV_NAMES)
+    """Configured once the Google client ID is in .env. The client secret and the grant stay Hermes's: a
+    missing secret or sign-in shows up as the ``auth_failed`` status at the first poll."""
+    return bool(_read_secret(ENV_CLIENT_ID))
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
@@ -110,17 +107,16 @@ def register(ctx: Any) -> None:
         """Cron delivery when no gateway runs in this process. It never touches the gateway's journal
         (NullStore): output documents are recognised by their signature line, not by the journal. Text
         only, like the live adapter: with attachments nothing is written, so nothing is half-delivered."""
-        from .google_api import GoogleClient, TokenSource
+        from .google_api import SIGN_IN, GoogleClient
         if media_files:
             return {"error": f"gemini-voice: {TEXT_ONLY}"}
-        credentials = [_read_secret(name) or "" for name in ENV_NAMES]
-        if not all(credentials):
-            return {"error": "gemini-voice is not configured; run `hermes gemini-voice auth`"}
+        if not _is_connected():
+            return {"error": f"gemini-voice is not configured: set {ENV_CLIENT_ID} and run `{SIGN_IN}`"}
 
         async def _no_dispatch(_task: Task) -> None:
             raise RuntimeError("standalone delivery cannot start tasks")
 
-        bridge = VoiceBridge(settings(), GoogleClient(TokenSource(*credentials)), NullStore(),
+        bridge = VoiceBridge(settings(), GoogleClient(), NullStore(),
                              _no_dispatch, lambda *_args: None)
         ok, ref = await bridge.deliver_output(str(chat_id), message)
         return {"success": True, "message_id": ref} if ok else {"error": ref}
@@ -128,12 +124,12 @@ def register(ctx: Any) -> None:
     ctx.register_platform(
         name=PLATFORM, label="Gemini Voice (Google Calendar, Docs, Sheets)", adapter_factory=factory,
         check_fn=lambda: True, is_connected=_is_connected, required_env=list(ENV_NAMES),
-        install_hint="Run `hermes gemini-voice auth` once on the server", trusted_inbound=True,
+        install_hint="Run `hermes auth add gemini-voice:google` once on the server", trusted_inbound=True,
         display_tier="minimal", platform_hint=PLATFORM_HINT, cron_deliver_env_var=HOME_CHANNEL_ENV,
         standalone_sender_fn=standalone_send, env_enablement_fn=_env_enablement, emoji="🎙",
         allow_update_command=False, max_message_length=0)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_cli_command(
-        name="gemini-voice", help="Gemini voice channel: authorize, check, status",
-        setup_fn=setup_parser, handler_fn=lambda args: handle(args, default_io(_read_secret, _save_env), ctx.state),
-        description="Authorize the plugin's own Google access once, verify it, and show the channel status.")
+        name="gemini-voice", help="Gemini voice channel: check, status",
+        setup_fn=setup_parser, handler_fn=lambda args: handle(args, default_io(_read_secret), ctx.state),
+        description="Verify the Google sign-in Hermes holds for the plugin and show the channel status.")
