@@ -511,7 +511,7 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         return real_client(*args, **{**kwargs, "transport": httpx.MockTransport(answer)})
 
     def token_post(url, data=None, **kwargs):
-        posts.append({"url": url, "data": dict(data or {}), "follow_redirects": kwargs.get("follow_redirects")})
+        posts.append({"url": url, "data": data, "follow_redirects": kwargs.get("follow_redirects")})
         return httpx.Response(token["status"], json=token["body"], request=httpx.Request("POST", url))
 
     def grant(**row):
@@ -525,42 +525,42 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         except Exception as exc:  # the plugin's own errors: GoogleError of whichever module sent the request
             return exc
 
+    def step(**kwargs):  # one call of the plugin, and exactly what it made Hermes send to Google and to the token URL
+        sent_before, posts_before = len(sent), len(posts)
+        result = call(**kwargs)
+        return result, sent[sent_before:], posts[posts_before:]
+
+    def one_request(made, method, url, bearer):  # exactly one request to Google: this method, URL and token
+        return (len(made) == 1 and made[0].method == method and str(made[0].url) == url
+                and made[0].headers.get("authorization") == f"Bearer {bearer}")
+
     expired = {"expires_at_ms": int(time.time() * 1000) - 1000}
     env = {"GEMINI_VOICE_CLIENT_ID": "probe-client-id", "GEMINI_VOICE_CLIENT_SECRET": canary}
     with ExitStack() as stack:
         stack.enter_context(mock.patch.object(httpx, "Client", offline_client))
         stack.enter_context(mock.patch.object(httpx, "post", token_post))
         stack.enter_context(mock.patch.dict(os.environ, env))
-        unsigned = call()
-        unsigned_sent = len(sent)
+        unsigned, unsigned_sent, unsigned_posts = step()
         grant()
-        ok = call("POST", docs, body={"requests": [{"insertText": {"text": "Привет"}}]}, headers={"If-Match": "e1"})
-        first = sent[0] if sent else None
-        after_ok = len(sent)  # exactly one request: nothing sent twice
-        off_list = call(url="https://example.com/x")
-        after_off = len(sent)
+        ok, ok_sent, ok_posts = step(method="POST", url=docs, body={"requests": [{"insertText": {"text": "Привет"}}]},
+                                     headers={"If-Match": "e1"})
+        off_list, off_sent, off_posts = step(url="https://example.com/x")
         google["status"] = 401
-        rejected = call()
-        after_401 = len(sent)
-        google["status"], before = 200, len(sent)
+        rejected, rejected_sent, rejected_posts = step()
+        google["status"] = 200
         grant(**expired)
         token.update(status=503, body={"error": "backend"})
-        posts_before = len(posts)
-        flaky = call()
-        flaky_sent, flaky_posts = len(sent) - before, posts[posts_before:]
+        flaky, flaky_sent, flaky_posts = step()
         token.update(status=200, body={"access_token": "probe-access-2", "expires_in": 3600})
-        sent_before, posts_before = len(sent), len(posts)
-        refreshed = call()
-        refreshed_sent, refresh_posts = len(sent) - sent_before, posts[posts_before:]
-        refreshed_auth = sent[-1].headers.get("authorization") if sent else ""
+        refreshed, refreshed_sent, refresh_posts = step()
         kept_refresh = plugin_oauth._read_grant(key).get("refresh_token")
         grant(**expired)
         token.update(status=400, body={"error": "invalid_grant"})
-        revoked = call()
+        revoked, revoked_sent, revoked_posts = step()
         dead = (plugin_oauth._read_grant(key) or {}).get("dead")
         grant(**expired)
         os.environ.pop("GEMINI_VOICE_CLIENT_ID")
-        no_client = call()
+        no_client, no_client_sent, no_client_posts = step()
         os.environ["GEMINI_VOICE_CLIENT_ID"] = env["GEMINI_VOICE_CLIENT_ID"]
         link = home / "plugins" / "gemini-voice-link"
         link_kind = _link(source_dir, link)
@@ -570,22 +570,23 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         stack.enter_context(mock.patch.dict(sys.modules, {spec_link.name: linked}))  # dataclasses look it up
         spec_link.loader.exec_module(linked)
         link_key = f"{plugin_oauth.plugin_key(link)}:{client.id}"
-        link_unsigned = call(module=linked)  # the link's own key: no grant yet, whatever the other copy holds
+        # The link's own key: no grant yet, whatever the other copy holds.
+        link_unsigned, link_unsigned_sent, link_unsigned_posts = step(module=linked)
         plugin_oauth._write_grant(link_key, {"access_token": "probe-access-link", "refresh_token": "probe-refresh",
                                              "expires_at_ms": int(time.time() * 1000) + 3_600_000,
                                              "fingerprint": client.fingerprint})
-        sent_before = len(sent)
-        through_link = call(module=linked)
-        link_sent = len(sent) - sent_before
-        link_auth = sent[-1].headers.get("authorization") if sent else ""
+        through_link, link_sent, link_posts = step(module=linked)
     texts = " ".join(str(x) for x in (unsigned, off_list, rejected, flaky, revoked, no_client, link_unsigned))
-    floor = re.search(r">=\s*([0-9][0-9.]*)", spec)
+    floor = re.fullmatch(r"\s*>=\s*(\d+\.\d+\.\d+)\s*", spec)  # one plain floor, no pre-release or local suffix
     refresh_form = {"grant_type": "refresh_token", "refresh_token": "probe-refresh",
                     "client_id": env["GEMINI_VOICE_CLIENT_ID"], "client_secret": canary}
 
     def one_token_post(made):  # exactly one POST, to the declared token URL, no redirect followed, the exact form
         return (len(made) == 1 and made[0]["url"] == client.token_url and made[0]["follow_redirects"] is False
-                and made[0]["data"] == refresh_form)
+                and isinstance(made[0]["data"], dict) and made[0]["data"] == refresh_form)
+
+    def nothing(*made):
+        return all(len(m) == 0 for m in made)
 
     def code(result):
         return getattr(result, "code", repr(result))
@@ -599,36 +600,39 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
             floor is not None and floor.group(1) == FIRST_ROUTE_RELEASE and version_satisfies(spec, FIRST_ROUTE_RELEASE)
             and not any(version_satisfies(spec, v) for v in EARLIER_RELEASES), f"{spec} vs {FIRST_ROUTE_RELEASE}"],
         "route: no sign-in, nothing sent, the command named": [
-            isinstance(unsigned, api.SignInError) and unsigned.code == "not_signed_in" and unsigned_sent == 0
-            and api.SIGN_IN in str(unsigned), str(unsigned)],
+            isinstance(unsigned, api.SignInError) and unsigned.code == "not_signed_in" and api.SIGN_IN in str(unsigned)
+            and nothing(unsigned_sent, unsigned_posts), str(unsigned)],
         "route: Hermes attaches the bearer, the plugin's body and headers arrive, once": [
-            getattr(ok, "body", None) == {"ok": True} and first is not None and after_ok == 1
-            and first.headers.get("authorization") == "Bearer probe-access" and first.headers.get("if-match") == "e1"
-            and json.loads(first.content) == {"requests": [{"insertText": {"text": "Привет"}}]},
-            repr(first.headers if first is not None else ok)],
+            getattr(ok, "body", None) == {"ok": True} and one_request(ok_sent, "POST", docs, "probe-access")
+            and ok_sent[0].headers.get("if-match") == "e1"
+            and json.loads(ok_sent[0].content) == {"requests": [{"insertText": {"text": "Привет"}}]} and nothing(ok_posts),
+            repr([(r.method, str(r.url), dict(r.headers)) for r in ok_sent])[:400]],
         "route: a host outside oauth: hosts is refused before sending": [
             code(off_list) == "route_refused" and "PermissionError" in str(off_list) and "example.com" in str(off_list)
-            and after_off == after_ok,
-            f"{after_ok}->{after_off} {off_list}"],
+            and nothing(off_sent, off_posts), str(off_list)],
         "route: a 401 is one request and an auth error": [
-            code(rejected) == "unauthorized" and after_401 == after_off + 1, f"{after_off}->{after_401} {rejected}"],
+            code(rejected) == "unauthorized" and one_request(rejected_sent, "GET", drive, "probe-access")
+            and nothing(rejected_posts), f"{len(rejected_sent)} {rejected}"],
         "route: a refresh that fails is retried later, Google not called": [
-            isinstance(flaky, api.TransientError) and code(flaky) == "oauth_refresh_failed" and flaky_sent == 0
-            and one_token_post(flaky_posts), f"{flaky} {flaky_posts and flaky_posts[0]['url']}"],
+            isinstance(flaky, api.TransientError) and code(flaky) == "oauth_refresh_failed" and nothing(flaky_sent)
+            and one_token_post(flaky_posts), f"{flaky} {[p['url'] for p in flaky_posts]}"],
         "route: Hermes refreshes with the client from .env and keeps the refresh token": [
-            getattr(refreshed, "status", 0) == 200 and refreshed_auth == "Bearer probe-access-2" and refreshed_sent == 1
+            getattr(refreshed, "status", 0) == 200 and one_request(refreshed_sent, "GET", drive, "probe-access-2")
             and kept_refresh == "probe-refresh" and one_token_post(refresh_posts),
-            f"{refreshed_auth} sent {refreshed_sent} {[(p['url'], sorted(p['data'])) for p in refresh_posts]}"],
+            f"sent {len(refreshed_sent)} {[(p['url'], sorted(p['data'])) for p in refresh_posts]}"],
         "route: a refused refresh is a revoked sign-in": [
-            code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant", str(revoked)],
+            code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant"
+            and nothing(revoked_sent) and one_token_post(revoked_posts), str(revoked)],
         "route: a missing client ID needs the operator": [
-            isinstance(no_client, api.SignInError) and code(no_client) == "oauth_client_id_missing", str(no_client)],
+            isinstance(no_client, api.SignInError) and code(no_client) == "oauth_client_id_missing"
+            and nothing(no_client_sent, no_client_posts), str(no_client)],
         "route: no secret or token in the plugin's errors": [
             all(s not in texts for s in (canary, "probe-access", "probe-refresh")), texts[:300]],
         "route: a plugin installed through a link is the caller, under its own key": [
             code(link_unsigned) == "not_signed_in" and "'gemini-voice-link'" in str(link_unsigned)
-            and getattr(through_link, "status", 0) == 200 and link_auth == "Bearer probe-access-link" and link_sent == 1,
-            f"{link_kind}: {link_unsigned} | {link_auth}"],
+            and nothing(link_unsigned_sent, link_unsigned_posts)
+            and getattr(through_link, "status", 0) == 200 and one_request(link_sent, "GET", drive, "probe-access-link")
+            and nothing(link_posts), f"{link_kind}: {link_unsigned} | {[str(r.url) for r in link_sent]}"],
     }
 
 

@@ -775,7 +775,7 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
             await h.bridge.tick()
         self.assertEqual(h.statuses[-1], ("retrying", "auth_failed"))
         self.assertIn("(unauthorized)", logs.output[0])
-        self.assertNotIn("CANARY", logs.output[0])
+        self.assertNotIn("CANARY", "".join(logs.output))
         self.assertNotIn("CANARY", h.store.get("journal")["status"]["message"])
 
     async def test_a_client_problem_points_to_the_env_not_to_a_new_sign_in(self):
