@@ -48,16 +48,18 @@ def run_check(io: CliIO) -> int:
         print(f"NOT_CONFIGURED: missing {ENV_CLIENT_ID} in the Hermes .env", file=out)
         return 1
     try:
-        failures = _probe_apis(GoogleClient(transport=io.transport), out)
-    except SignInError as exc:
+        failures, auth_codes = _probe_apis(GoogleClient(transport=io.transport), out)
+    except SignInError as exc:  # Hermes sent nothing; its own words name the reason
         print(f"AUTH_FAILED: {exc}", file=out)
         print(f"To fix it: {auth_fix(exc.code)}", file=out)
         return 1
+    for code in dict.fromkeys(auth_codes):  # Google refused the token itself: the code only, never its text
+        print(f"AUTH_FAILED: {code}\nTo fix it: {auth_fix(code)}", file=out)
     return 0 if not failures else 1
 
 
-def _probe_apis(client: GoogleClient, out: TextIO) -> int:
-    failures = 0
+def _probe_apis(client: GoogleClient, out: TextIO) -> "tuple[int, list[str]]":
+    failures, auth_codes = 0, []
     for name, url, params in API_PROBES:
         try:
             client.request("GET", url, params=params)
@@ -66,11 +68,14 @@ def _probe_apis(client: GoogleClient, out: TextIO) -> int:
             raise  # Hermes sent nothing: the same answer for every API
         except ApiError as exc:
             result = "OK" if exc.status == 404 else f"FAILED {exc.code}"
-        except (AuthError, TransientError) as exc:
+        except AuthError as exc:
+            result = f"FAILED {exc.code}"
+            auth_codes.append(exc.code)
+        except TransientError as exc:
             result = f"FAILED {exc.code}"
         failures += 0 if result == "OK" else 1
         print(f"{name} API: {result}", file=out)
-    return failures
+    return failures, auth_codes
 
 
 def run_status(store: Any, out: TextIO) -> int:

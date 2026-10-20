@@ -42,6 +42,7 @@ class FakeGoogle:
         self.sheets: Dict[str, List[List[str]]] = {}
         self.calls: List[Tuple[str, str, Dict[str, str], Any]] = []
         self.refusal: Optional[Exception] = None  # raised before anything is sent, as Hermes's route does
+        self.error_message = "error"  # error.message of refused requests (Google's own text)
         self.offline = False
         self.fail_writes = False
         self.fail_cell_writes = False  # writing cell values fails (a values PUT, or a batchUpdate that writes cells)
@@ -121,7 +122,7 @@ class FakeGoogle:
             return _error(503, "backendError")
         if (method, base) in self.refuse:
             status, reason = self.refuse[(method, base)]
-            return _error(status, reason)
+            return _error(status, reason, self.error_message)
         reply = self._route(method, base, params, payload, headers)
         if self.lose_response_once and self.lose_response_once[0] == method \
                 and base.startswith(self.lose_response_once[1]):

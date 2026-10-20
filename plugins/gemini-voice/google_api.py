@@ -114,8 +114,9 @@ def auth_fix(code: str) -> str:
     if code in ("not_signed_in", "insufficient_scope"):
         return f"run `{SIGN_IN}` on the Hermes host and allow all four permissions; polling resumes by itself"
     if code == "unauthorized":
-        return ("nothing at first: Hermes refreshes the token when it expires and polling retries every 15 minutes; "
-                f"if it keeps failing, run `{SIGN_IN}`")
+        return ("nothing at first: Hermes refreshes the token when it expires and polling retries every 15 minutes "
+                "(`hermes auth refresh gemini-voice:google` refreshes it now); if it keeps failing, "
+                f"run `{SIGN_IN}`")
     if code == "hermes_too_old":
         return "update Hermes to a release with the plugin OAuth route"
     # route_refused, route_failed, invalid_scope and anything new: a new sign-in would not help

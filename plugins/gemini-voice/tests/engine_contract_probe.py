@@ -465,6 +465,11 @@ def _link(target: Path, link: Path) -> str:
         return "junction"
 
 
+# The first Hermes release with the plugin OAuth route; set together with requires_hermes once it ships.
+FIRST_ROUTE_RELEASE = "0.23.0"
+EARLIER_RELEASES = ("0.21.6", "0.22.0", "0.22.1", "0.22.2")
+
+
 def route_checks(package: str, home: Path, source_dir: Path) -> dict:
     """Hermes's plugin OAuth route around the plugin loaded by the real loader. Only the network is faked: Google
     and the token endpoint answer in memory. A grant is written the way ``hermes auth add`` writes it."""
@@ -505,8 +510,8 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
     def offline_client(*args, **kwargs):
         return real_client(*args, **{**kwargs, "transport": httpx.MockTransport(answer)})
 
-    def token_post(url, data=None, **_):
-        posts.append(dict(data or {}))
+    def token_post(url, data=None, **kwargs):
+        posts.append({"url": url, "data": dict(data or {}), "follow_redirects": kwargs.get("follow_redirects")})
         return httpx.Response(token["status"], json=token["body"], request=httpx.Request("POST", url))
 
     def grant(**row):
@@ -531,7 +536,7 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         grant()
         ok = call("POST", docs, body={"requests": [{"insertText": {"text": "Привет"}}]}, headers={"If-Match": "e1"})
         first = sent[0] if sent else None
-        after_ok = len(sent)
+        after_ok = len(sent)  # exactly one request: nothing sent twice
         off_list = call(url="https://example.com/x")
         after_off = len(sent)
         google["status"] = 401
@@ -540,13 +545,15 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         google["status"], before = 200, len(sent)
         grant(**expired)
         token.update(status=503, body={"error": "backend"})
+        posts_before = len(posts)
         flaky = call()
-        flaky_sent = len(sent) - before
+        flaky_sent, flaky_posts = len(sent) - before, posts[posts_before:]
         token.update(status=200, body={"access_token": "probe-access-2", "expires_in": 3600})
+        sent_before, posts_before = len(sent), len(posts)
         refreshed = call()
+        refreshed_sent, refresh_posts = len(sent) - sent_before, posts[posts_before:]
         refreshed_auth = sent[-1].headers.get("authorization") if sent else ""
         kept_refresh = plugin_oauth._read_grant(key).get("refresh_token")
-        refresh_form = posts[-1] if posts else {}
         grant(**expired)
         token.update(status=400, body={"error": "invalid_grant"})
         revoked = call()
@@ -567,10 +574,18 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         plugin_oauth._write_grant(link_key, {"access_token": "probe-access-link", "refresh_token": "probe-refresh",
                                              "expires_at_ms": int(time.time() * 1000) + 3_600_000,
                                              "fingerprint": client.fingerprint})
+        sent_before = len(sent)
         through_link = call(module=linked)
+        link_sent = len(sent) - sent_before
         link_auth = sent[-1].headers.get("authorization") if sent else ""
     texts = " ".join(str(x) for x in (unsigned, off_list, rejected, flaky, revoked, no_client, link_unsigned))
     floor = re.search(r">=\s*([0-9][0-9.]*)", spec)
+    refresh_form = {"grant_type": "refresh_token", "refresh_token": "probe-refresh",
+                    "client_id": env["GEMINI_VOICE_CLIENT_ID"], "client_secret": canary}
+
+    def one_token_post(made):  # exactly one POST, to the declared token URL, no redirect followed, the exact form
+        return (len(made) == 1 and made[0]["url"] == client.token_url and made[0]["follow_redirects"] is False
+                and made[0]["data"] == refresh_form)
 
     def code(result):
         return getattr(result, "code", repr(result))
@@ -580,14 +595,14 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
             len(clients) == 1 and clients[0].id == api.OAUTH_ID and not problems, repr(problems)],
         "route: no reviewer warning, tests included": [bool(clients) and not problems and warnings == [],
                                                        repr(warnings or problems)],
-        "route: requires_hermes admits its floor and no release without the route": [
-            floor is not None and version_satisfies(spec, floor.group(1))
-            and not any(version_satisfies(spec, v) for v in ("0.21.6", "0.22.0", "0.22.1", "0.22.2")), spec],
+        "route: requires_hermes starts at the first release with the route": [
+            floor is not None and floor.group(1) == FIRST_ROUTE_RELEASE and version_satisfies(spec, FIRST_ROUTE_RELEASE)
+            and not any(version_satisfies(spec, v) for v in EARLIER_RELEASES), f"{spec} vs {FIRST_ROUTE_RELEASE}"],
         "route: no sign-in, nothing sent, the command named": [
             isinstance(unsigned, api.SignInError) and unsigned.code == "not_signed_in" and unsigned_sent == 0
             and api.SIGN_IN in str(unsigned), str(unsigned)],
-        "route: Hermes attaches the bearer, the plugin's body and headers arrive": [
-            getattr(ok, "body", None) == {"ok": True} and first is not None
+        "route: Hermes attaches the bearer, the plugin's body and headers arrive, once": [
+            getattr(ok, "body", None) == {"ok": True} and first is not None and after_ok == 1
             and first.headers.get("authorization") == "Bearer probe-access" and first.headers.get("if-match") == "e1"
             and json.loads(first.content) == {"requests": [{"insertText": {"text": "Привет"}}]},
             repr(first.headers if first is not None else ok)],
@@ -598,14 +613,12 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
         "route: a 401 is one request and an auth error": [
             code(rejected) == "unauthorized" and after_401 == after_off + 1, f"{after_off}->{after_401} {rejected}"],
         "route: a refresh that fails is retried later, Google not called": [
-            isinstance(flaky, api.TransientError) and code(flaky) == "oauth_refresh_failed" and flaky_sent == 0,
-            str(flaky)],
+            isinstance(flaky, api.TransientError) and code(flaky) == "oauth_refresh_failed" and flaky_sent == 0
+            and one_token_post(flaky_posts), f"{flaky} {flaky_posts and flaky_posts[0]['url']}"],
         "route: Hermes refreshes with the client from .env and keeps the refresh token": [
-            getattr(refreshed, "status", 0) == 200 and refreshed_auth == "Bearer probe-access-2"
-            and kept_refresh == "probe-refresh" and refresh_form.get("grant_type") == "refresh_token"
-            and refresh_form.get("refresh_token") == "probe-refresh"
-            and refresh_form.get("client_id") == env["GEMINI_VOICE_CLIENT_ID"] and refresh_form.get("client_secret") == canary,
-            f"{refreshed_auth} {sorted(refresh_form)}"],
+            getattr(refreshed, "status", 0) == 200 and refreshed_auth == "Bearer probe-access-2" and refreshed_sent == 1
+            and kept_refresh == "probe-refresh" and one_token_post(refresh_posts),
+            f"{refreshed_auth} sent {refreshed_sent} {[(p['url'], sorted(p['data'])) for p in refresh_posts]}"],
         "route: a refused refresh is a revoked sign-in": [
             code(revoked) == "not_signed_in" and "revoked" in str(revoked) and dead == "invalid_grant", str(revoked)],
         "route: a missing client ID needs the operator": [
@@ -614,7 +627,7 @@ def route_checks(package: str, home: Path, source_dir: Path) -> dict:
             all(s not in texts for s in (canary, "probe-access", "probe-refresh")), texts[:300]],
         "route: a plugin installed through a link is the caller, under its own key": [
             code(link_unsigned) == "not_signed_in" and "'gemini-voice-link'" in str(link_unsigned)
-            and getattr(through_link, "status", 0) == 200 and link_auth == "Bearer probe-access-link",
+            and getattr(through_link, "status", 0) == 200 and link_auth == "Bearer probe-access-link" and link_sent == 1,
             f"{link_kind}: {link_unsigned} | {link_auth}"],
     }
 

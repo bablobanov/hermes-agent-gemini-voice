@@ -766,6 +766,18 @@ class UnattendedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.statuses[-1], ("connected", ""))
         self.assertEqual(len(h.dispatched), 1)
 
+    async def test_a_google_401_keeps_only_its_code_in_the_status(self):
+        h = Harness()
+        h.fake.refuse[("GET", "https://www.googleapis.com/drive/v3/files")] = (401, "authError")
+        h.fake.refuse[("GET", "https://www.googleapis.com/calendar/v3/calendars/primary/events")] = (401, "authError")
+        h.fake.error_message = "CANARY ya29.reflected"
+        with self.assertLogs("gemini_voice", "ERROR") as logs:
+            await h.bridge.tick()
+        self.assertEqual(h.statuses[-1], ("retrying", "auth_failed"))
+        self.assertIn("(unauthorized)", logs.output[0])
+        self.assertNotIn("CANARY", logs.output[0])
+        self.assertNotIn("CANARY", h.store.get("journal")["status"]["message"])
+
     async def test_a_client_problem_points_to_the_env_not_to_a_new_sign_in(self):
         h = Harness()
         h.fake.refusal = api.SignInError("oauth_client_secret_missing", "GEMINI_VOICE_CLIENT_SECRET is not set.")

@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import unittest
 
 from _load import load
@@ -72,6 +73,20 @@ class CheckAndStatusTests(unittest.TestCase):
         self.assertEqual(cli.run_check(cli_io), 1)
         self.assertIn("Docs API: FAILED insufficient_scope", out.getvalue())
         self.assertIn("Sheets API: OK", out.getvalue())
+        self.assertIn("AUTH_FAILED: insufficient_scope", out.getvalue())
+        self.assertIn("To fix it: run `hermes auth add gemini-voice:google`", out.getvalue())
+
+    def test_check_a_401_names_its_fix_and_never_google_text(self):
+        def transport(method, url, headers, body, timeout):
+            payload = {"error": {"code": 401, "message": "CANARY-401" + chr(10) + "second line",
+                                 "status": "UNAUTHENTICATED"}}
+            return 401, {}, json.dumps(payload).encode()
+        out = io.StringIO()
+        self.assertEqual(cli.run_check(cli.CliIO(stdout=out, read_secret=CONFIGURED.get, transport=transport)), 1)
+        text = out.getvalue()
+        self.assertEqual(text.count("AUTH_FAILED: unauthorized"), 1)  # once, not once per API
+        self.assertIn("hermes auth refresh gemini-voice:google", text)
+        self.assertNotIn("CANARY", text)
 
     def test_check_not_configured(self):
         fake = FakeGoogle()
